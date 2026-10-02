@@ -1,0 +1,128 @@
+# Carpet bombing (prefix kapsamı) ve hacimsel toplam kurallar (host/object kapsamı)
+#
+# Carpet bombing: Saldırgan tek bir IP yerine bütün bir /24'ü (veya daha
+# genişini) hedefler. Her host kendi eşiğinin altında kalır, bu yüzden host
+# bazlı algılama hiçbir şey görmez, ama prefix toplamı bağlantıyı doldurur.
+# NETSCOUT 1H2025 verisine göre carpet bombing ağırlıklı olarak /24 blokları
+# hedefliyor ve 500 Gbps'e kadar çıkabiliyor.
+#
+# En iyi uygulamalar:
+#   - Toplamı nesnenin carpet_prefix_v4 / carpet_prefix_v6 uzunluğunda alın
+#     (varsayılan /24 ve /64).
+#   - Prefix kapsamında hedefe gelen benzersiz kaynakla birlikte
+#     "etkilenen benzersiz hedef" sayısına da bakılır (UI/kanıt).
+#   - FlowSpec hedefi prefix olur; RTBH carpet bombing için UYGULANMAZ
+#     (bütün bloğu karartır).
+
+rules:
+  - id: carpet_amplification
+    name: Carpet Bombing — UDP Amplifikasyon
+    category: carpet_bombing
+    description: Bilinen yansıtma portlarından gelen UDP trafiğinin bir prefix'e yayılarak gönderilmesi.
+    direction: inbound
+    scope: prefix
+    severity: critical
+    match:
+      protocols: [udp]
+      src_ports: ["53", "123", "1900", "11211", "389", "161", "19", "17", "137", "111", "1434", "3702", "3283", "5683", "427", "10001", "37810", "69", "47808", "623", "5351", "520"]
+    thresholds: { pps: 40k, bps: 400Mbps }
+    baseline: { enabled: true, factor: 6, min_pps: 10k, min_bps: 100Mbps }
+    conditions: { min_unique_sources: 30, min_unique_destinations: 16 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-discard, note: FlowSpec prefix hedefli ve kanıttaki baskın kaynak port ile oluşturulur. }
+
+  - id: carpet_udp
+    name: Carpet Bombing — UDP Flood
+    category: carpet_bombing
+    description: Bir prefix'e dağıtılmış genel UDP flood.
+    direction: inbound
+    scope: prefix
+    severity: high
+    match: { protocols: [udp] }
+    thresholds: { pps: 500k, bps: 3Gbps }
+    baseline: { enabled: true, factor: 5, min_pps: 100k, min_bps: 1Gbps }
+    conditions: { min_unique_sources: 50, min_unique_destinations: 16 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: scrub }
+
+  - id: carpet_syn
+    name: Carpet Bombing — TCP SYN
+    category: carpet_bombing
+    description: Bir prefix'teki çok sayıda hosta dağıtılmış SYN flood.
+    direction: inbound
+    scope: prefix
+    severity: high
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [syn], none: [ack, rst, fin] }
+      max_packet_size: 120
+    thresholds: { pps: 150k }
+    baseline: { enabled: true, factor: 6, min_pps: 30k }
+    conditions: { min_unique_destinations: 16 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: scrub }
+
+  - id: carpet_icmp
+    name: Carpet Bombing — ICMP
+    category: carpet_bombing
+    description: Bir prefix'e yayılmış ICMP flood.
+    direction: inbound
+    scope: prefix
+    severity: medium
+    match: { protocols: [icmp, icmpv6] }
+    thresholds: { pps: 100k, bps: 400Mbps }
+    conditions: { min_unique_destinations: 16 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-rate-limit, rate: 20Mbps }
+
+  - id: carpet_fragments
+    name: Carpet Bombing — Fragment
+    category: carpet_bombing
+    description: Bir prefix'e yayılmış IP fragment trafiği (genellikle amplifikasyonun parçalanmış kısmı).
+    direction: inbound
+    scope: prefix
+    severity: high
+    match: { fragment: true }
+    thresholds: { pps: 60k, bps: 600Mbps }
+    conditions: { min_unique_destinations: 16 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-rate-limit, rate: 100Mbps }
+
+  - id: total_host
+    name: Hosta Toplam Trafik Aşımı
+    category: volumetric
+    description: Tek bir hedefe gelen tüm trafiğin statik veya baseline eşiği aşması (vektörden bağımsız güvenlik ağı).
+    direction: inbound
+    scope: host
+    severity: high
+    match: {}
+    thresholds: { pps: 1.5M, bps: 8Gbps }
+    baseline: { enabled: true, factor: 6, min_pps: 200k, min_bps: 2Gbps }
+    trigger: { sustain: 5s, hold_down: 90s }
+    mitigation: { action: scrub, rtbh_escalation: 0.9, note: Vektör kuralları tetiklenmediyse kanıttaki dağılıma bakın; bağlantı doluyorsa RTBH son çaredir. }
+
+  - id: total_object
+    name: Nesneye Toplam Trafik Aşımı
+    category: volumetric
+    description: Korunan nesnenin (müşteri/blok) tamamına gelen trafiğin baseline'dan ciddi sapması.
+    direction: inbound
+    scope: object
+    severity: high
+    match: {}
+    thresholds: { bps: 40Gbps }
+    baseline: { enabled: true, factor: 4, min_pps: 500k, min_bps: 4Gbps }
+    trigger: { sustain: 10s, hold_down: 120s }
+    mitigation: { action: scrub }
+
+  - id: total_object_udp
+    name: Nesneye UDP Toplamı Aşımı
+    category: volumetric
+    description: Nesneye gelen toplam UDP trafiğinde baseline sapması (dağıtık UDP saldırılarının erken uyarısı).
+    direction: inbound
+    scope: object
+    severity: medium
+    match: { protocols: [udp] }
+    thresholds: { bps: 20Gbps }
+    baseline: { enabled: true, factor: 5, min_pps: 200k, min_bps: 2Gbps }
+    trigger: { sustain: 10s, hold_down: 120s }
+    mitigation: { action: alert }

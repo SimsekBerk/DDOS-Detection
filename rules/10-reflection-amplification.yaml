@@ -1,0 +1,230 @@
+# Yansıma / Amplifikasyon saldırıları (inbound, host kapsamı)
+#
+# Mekanizma: Saldırgan, kurbanın IP'sini kaynak adres olarak sahteleyip (spoof)
+# açık UDP servislerine küçük istekler gönderir; servisler kurbana çok daha
+# büyük cevaplar döner. Kurbana gelen trafiğin İMZASI şudur:
+#   - protokol UDP, KAYNAK port = istismar edilen servisin portu
+#   - çok sayıda farklı kaynak (yansıtıcılar)
+#   - büyük ortalama paket boyu (amplifikasyon), sıklıkla IP fragment'ları
+#
+# En iyi uygulamalar:
+#   - Eşleşmeyi kaynak porta göre yapın; hedef port rastgeledir.
+#   - min_unique_sources ile tek kaynaklı meşru trafiği ayıklayın.
+#   - FlowSpec'te kaynak IP KULLANMAYIN (binlerce yansıtıcı); hedef /32 +
+#     protokol + kaynak port (+ paket boyu) yeterli ve dar etkilidir.
+#   - Fragment'lar ilk paketin portunu taşımaz: amplifikasyonla birlikte
+#     30-fragment kurallarındaki UDP fragment kuralı da tetiklenir.
+#   - Referans: CISA "UDP-Based Amplification Attacks" (TA14-017A),
+#     RFC 5358 (DNS), RFC 8633 (NTP BCP), Shadowserver açık servis raporları.
+
+rules:
+  - id: amp_dns
+    name: DNS Amplification
+    category: reflection_amplification
+    description: Kaynak portu 53 olan büyük UDP cevapları; açık resolver'lar üzerinden yansıtma (ANY/DNSSEC/TXT sorguları).
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [udp]
+      src_ports: ["53"]
+      min_packet_size: 512
+    thresholds: { pps: 20k, bps: 200Mbps }
+    baseline: { enabled: true, factor: 8, min_pps: 5k, min_bps: 50Mbps }
+    conditions: { min_unique_sources: 20, min_avg_packet_size: 512 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation:
+      action: flowspec-discard
+      packet_length: true
+      rtbh_escalation: 0.8
+      note: Sadece >=512 byte DNS cevapları düşürülür; kurbanın normal DNS çözümlemesi etkilenmez. Resolver'larınızı dns_server profiline alın.
+    rationale: Normal DNS cevapları çoğunlukla 512 byte altındadır; EDNS0 ile büyük cevaplar meşrudur ama saniyede binlerce farklı kaynaktan gelmez.
+    false_positives: Özyinelemeli DNS sunucuları (resolver) yüksek miktarda meşru cevap alır → dns_server profili.
+    references: ["CISA TA14-017A", "RFC 5358"]
+
+  - id: amp_ntp
+    name: NTP Amplification (monlist)
+    category: reflection_amplification
+    description: Kaynak portu 123, ~468 byte'lık monlist/mode 7 cevapları.
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [udp]
+      src_ports: ["123"]
+      min_packet_size: 200
+    thresholds: { pps: 10k, bps: 100Mbps }
+    baseline: { enabled: true, factor: 8, min_pps: 2k, min_bps: 20Mbps }
+    conditions: { min_unique_sources: 10, min_avg_packet_size: 200 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation:
+      action: flowspec-discard
+      packet_length: true
+      rtbh_escalation: 0.8
+      note: Normal NTP paketleri 76-90 byte'tır; >=200 byte filtrelemek saat senkronizasyonunu bozmaz.
+    rationale: monlist cevabı 100 adet 468 byte paketten oluşur (yaklaşık 556x amplifikasyon).
+    false_positives: Çok nadir. NTP sunucularının dış kaynaklardan büyük paket almaması beklenir.
+    references: ["CVE-2013-5211", "RFC 8633"]
+
+  - id: amp_ssdp
+    name: SSDP Amplification
+    category: reflection_amplification
+    description: Kaynak portu 1900; UPnP cihazlarının M-SEARCH cevapları.
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [udp], src_ports: ["1900"] }
+    thresholds: { pps: 10k, bps: 100Mbps }
+    conditions: { min_unique_sources: 20 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8, note: İnternetten UDP/1900 kaynaklı trafik meşru değildir. }
+    rationale: SSDP yerel ağ protokolüdür; internet üzerinden gelmesi yansıtma göstergesidir.
+    references: ["CISA TA14-017A"]
+
+  - id: amp_memcached
+    name: Memcached Amplification
+    category: reflection_amplification
+    description: Kaynak portu 11211; 50.000x'e varan amplifikasyon, Tbps seviyesi saldırılar.
+    direction: inbound
+    scope: host
+    severity: critical
+    match: { protocols: [udp], src_ports: ["11211"] }
+    thresholds: { pps: 1k, bps: 20Mbps }
+    conditions: { min_unique_sources: 3 }
+    trigger: { sustain: 2s, hold_down: 120s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.5, note: UDP/11211 internet üzerinde asla meşru değildir; doğrudan düşürün. }
+    rationale: Memcached UDP'nin internetten erişilebilir olması tamamen yanlış yapılandırmadır.
+    references: ["CVE-2018-1000115"]
+
+  - id: amp_cldap
+    name: CLDAP Amplification
+    category: reflection_amplification
+    description: Kaynak portu UDP/389; Active Directory CLDAP cevapları (56-70x).
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [udp], src_ports: ["389"] }
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 10 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8 }
+    rationale: CLDAP iç ağ protokolüdür; internetten gelen cevaplar yansıtma göstergesidir.
+    references: ["Akamai CLDAP advisory 2016"]
+
+  - id: amp_snmp
+    name: SNMP Amplification
+    category: reflection_amplification
+    description: Kaynak portu UDP/161; GetBulk cevapları.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [udp], src_ports: ["161"] }
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 10 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8 }
+    false_positives: Dış ağdaki cihazları izleyen NMS sunucuları → bu hostları ayrı nesne/profil olarak tanımlayın.
+    references: ["CISA TA14-017A"]
+
+  - id: amp_chargen_qotd
+    name: CharGEN / QOTD Amplification
+    category: reflection_amplification
+    description: Kaynak portu UDP/19 (CharGEN) veya UDP/17 (QOTD); eski servisler.
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [udp], src_ports: ["19", "17"] }
+    thresholds: { pps: 2k, bps: 20Mbps }
+    conditions: { min_unique_sources: 5 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8, note: Bu portlardan meşru trafik beklenmez. }
+    references: ["CISA TA14-017A"]
+
+  - id: amp_netbios_rpc
+    name: NetBIOS / Portmap / MSSQL Amplification
+    category: reflection_amplification
+    description: Kaynak portu UDP/137 (NetBIOS), UDP/111 (Portmap), UDP/1434 (MSSQL Browser).
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [udp], src_ports: ["137", "111", "1434"] }
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 10 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8 }
+    references: ["CISA TA14-017A"]
+
+  - id: amp_wsd_arms
+    name: WS-Discovery / ARMS / CoAP Amplification
+    category: reflection_amplification
+    description: Kaynak portu UDP/3702 (WS-Discovery), UDP/3283 (Apple ARD), UDP/5683 (CoAP).
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [udp], src_ports: ["3702", "3283", "5683"] }
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 10 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8 }
+    rationale: IoT/LAN keşif protokolleri; internete açık cihazlar 10-150x amplifikasyon sağlar.
+    references: ["NETSCOUT ASERT WS-DD 2019", "CoAP RFC 7252 §11.3"]
+
+  - id: amp_discovery_misc
+    name: Keşif Protokolü Amplification (SLP/mDNS/Ubiquiti/DHDiscover/TFTP)
+    category: reflection_amplification
+    description: Kaynak portu UDP/427 (SLP), 5353 (mDNS), 10001 (Ubiquiti), 37810 (DHDiscover), 69 (TFTP), 33848 (Jenkins).
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [udp], src_ports: ["427", "5353", "10001", "37810", "69", "33848"] }
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 10 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8 }
+    rationale: SLP (CVE-2023-29552) 2200x'e kadar amplifikasyon sağlar; diğerleri yerel ağ servisleridir.
+    references: ["CVE-2023-29552", "CVE-2020-2100"]
+
+  - id: amp_misc_udp
+    name: Diğer UDP Yansıtıcılar (BACnet/IPMI/NAT-PMP/Plex/Lantronix/XDMCP/RIPv1)
+    category: reflection_amplification
+    description: Kaynak portu UDP/47808, 623, 5351, 32414, 30718, 177, 520.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [udp], src_ports: ["47808", "623", "5351", "32414", "30718", "177", "520"] }
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 10 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8 }
+    references: ["Shadowserver Open Service Reports"]
+
+  - id: amp_stun
+    name: STUN / TURN Amplification
+    category: reflection_amplification
+    description: Kaynak portu UDP/3478. WebRTC nedeniyle düşük hacimde meşru; yüksek hacim ve çok kaynak yansıtmadır.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [udp], src_ports: ["3478"] }
+    thresholds: { pps: 20k, bps: 200Mbps }
+    baseline: { enabled: true, factor: 6, min_pps: 5k, min_bps: 50Mbps }
+    conditions: { min_unique_sources: 50 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 20Mbps, rtbh_escalation: 0.8, note: WebRTC trafiğini tamamen kesmemek için rate-limit. }
+
+  - id: amp_generic_lowport
+    name: Bilinmeyen UDP Yansıtma (düşük kaynak port)
+    category: reflection_amplification
+    description: Kaynak portu 1-1023 aralığında, çok sayıda kaynaktan gelen büyük UDP paketleri. Listede olmayan yeni yansıtma vektörlerini yakalar.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [udp]
+      src_ports: ["1-1023"]
+    thresholds: { pps: 50k, bps: 500Mbps }
+    baseline: { enabled: true, factor: 6, min_pps: 10k, min_bps: 100Mbps }
+    conditions: { min_unique_sources: 100, min_avg_packet_size: 400 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: scrub, rtbh_escalation: 0.8, note: Vektör kesinleşmeden discard yerine scrubbing; kanıttaki top kaynak porta göre FlowSpec önerilir. }
+    rationale: Sıfırıncı gün yansıtma vektörleri için genel ağ; meşru UDP cevapları nadiren yüzlerce farklı kaynaktan ve büyük paketlerle gelir.

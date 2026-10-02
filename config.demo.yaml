@@ -1,0 +1,52 @@
+# Demo yapılandırması: tek komutla çalışır, sentetik trafik üretir.
+#   go run ./cmd/ddosd -config config.demo.yaml   →  http://localhost:8090
+#
+# Simülatör gerçek NetFlow v9 paketleri üretip 127.0.0.1:2055'e gönderir;
+# yani decoder → motor → olay → mitigasyon → AI analist zincirinin tamamı
+# çalışır. "Simülatör" sayfasından saldırı senaryoları başlatabilirsiniz.
+
+collector:
+  listen: [":2055", ":4739", ":6343"]
+
+protected_objects:
+  - name: Demo-DC
+    prefixes: ["198.51.100.0/24", "2001:db8:100::/48"]
+    profile: datacenter
+    link_capacity: 10Gbps
+    notes: "Demo veri merkezi bloğu (TEST-NET-2)"
+  - name: Demo-Hosting
+    prefixes: ["203.0.113.0/24"]
+    profile: default
+    link_capacity: 5Gbps
+    notes: "Demo hosting bloğu (TEST-NET-3)"
+
+rules_dir: rules
+data_dir: data-demo
+
+engine:
+  window: 10s
+  baseline_tau: 10m
+  baseline_learn: 3m        # demo için kısa öğrenme süresi
+
+mitigation:
+  mode: manual
+  driver: dryrun
+  allow_rtbh: true
+  never_mitigate: ["198.51.100.53/32"]
+
+analyst:
+  enabled: true
+  provider: heuristic       # ANTHROPIC_API_KEY ile "anthropic" yapabilirsiniz
+  auto_run: false
+  interval: 2m
+
+api:
+  listen: ":8090"
+
+demo:
+  enabled: true
+  encoder: netflow9         # netflow5 | netflow9 | ipfix | sflow
+  sampling_rate: 1
+  target: 127.0.0.1:2055
+  baseline: true
+  baseline_bps: 600Mbps

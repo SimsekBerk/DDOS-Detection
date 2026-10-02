@@ -1,0 +1,65 @@
+# Koruma profilleri
+#
+# Her korunan nesne (protected_objects) bir profile bağlanır. Profil, kural
+# eşiklerini nesnenin tipine göre ölçekler (scale), belirli kuralları kapatır
+# (disable) veya kural bazında özel eşik/ölçek tanımlar (overrides).
+#
+# Efektif eşik = kural eşiği × profil.scale × override.scale
+# override içinde pps/bps/fps verilirse o değer doğrudan kullanılır.
+#
+# En iyi uygulama: Profilleri "ne tür bir servis" sorusuna göre seçin. Tek bir
+# global eşik hem DNS sunucusunda hem de ev kullanıcısında doğru olamaz.
+
+profiles:
+  - name: default
+    description: Genel amaçlı varsayılan profil (karışık sunucu/istemci trafiği).
+    scale: 1.0
+
+  - name: residential
+    description: Ev/abone blokları. Sunucu servisi beklenmez; eşikler daha düşük.
+    scale: 0.5
+    overrides:
+      tcp_synack_reflection: { scale: 3 }   # istemciler çok sayıda giden bağlantı açar
+      tcp_ack_flood: { scale: 2 }
+
+  - name: datacenter
+    description: Veri merkezi / hosting sunucuları. Yüksek meşru trafik.
+    scale: 2.0
+
+  - name: web
+    description: Web/CDN önü sunucular (TCP/80-443, QUIC/UDP-443).
+    scale: 2.0
+    overrides:
+      udp_quic_flood: { scale: 3 }
+      tcp_ack_flood: { scale: 2 }
+      tcp_conn_flood: { scale: 3 }
+
+  - name: dns_server
+    description: Yetkili veya özyinelemeli DNS sunucuları.
+    scale: 1.5
+    overrides:
+      amp_dns: { scale: 20 }                # resolver'lar meşru olarak büyük DNS cevapları alır
+      out_reflector_dns: { scale: 50 }      # yetkili sunucular yoğun cevap üretir
+      udp_flood_host: { scale: 3 }
+
+  - name: gaming
+    description: Oyun/VoIP sunucuları; yoğun UDP meşrudur.
+    scale: 1.5
+    overrides:
+      udp_flood_host: { scale: 4 }
+      udp_small_packet_flood: { scale: 4 }
+      amp_stun: { scale: 5 }
+
+  - name: vpn_gateway
+    description: IPsec/GRE tünel uç noktaları.
+    scale: 1.0
+    disable: [gre_flood]
+    overrides:
+      esp_flood: { scale: 20 }
+      udp_fragment_flood: { scale: 5 }      # tünel MTU nedeniyle fragment olağan olabilir
+
+  - name: infrastructure
+    description: Router loopback/yönetim adresleri; kontrol düzlemi çok hassastır.
+    scale: 0.2
+    overrides:
+      infra_bgp_flood: { scale: 5 }         # 0.2 × 5 = 1.0 → BGP için varsayılan eşik

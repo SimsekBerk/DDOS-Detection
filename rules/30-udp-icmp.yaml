@@ -1,0 +1,140 @@
+# UDP ve ICMP floodları (inbound, host kapsamı)
+#
+# En iyi uygulamalar:
+#   - Genel UDP flood'da hedef servis UDP ise (DNS, oyun, VoIP, QUIC) discard
+#     servisi de keser; scrubbing veya oran sınırlama tercih edilir.
+#   - ICMP'yi tamamen kapatmayın: PMTUD (Type 3 Code 4 / ICMPv6 Packet Too Big)
+#     ve teşhis için gereklidir. Oran sınırlama doğru yaklaşımdır (RFC 4890).
+#   - BlackNurse (Type 3 Code 3) düşük hacimde (≈15-20 Mbps) bile güvenlik
+#     duvarlarını çökertebilir; eşiği düşük tutun.
+
+rules:
+  - id: udp_flood_host
+    name: UDP Flood (genel)
+    category: udp_flood
+    description: Hedefe gelen toplam UDP trafiğinde statik eşik veya baseline aşımı (rastgele port flood'ları dahil).
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [udp] }
+    thresholds: { pps: 200k, bps: 1Gbps }
+    baseline: { enabled: true, factor: 5, min_pps: 30k, min_bps: 200Mbps }
+    conditions: { min_unique_sources: 20 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: scrub, rtbh_escalation: 0.8, note: Hedef UDP servisi sunuyorsa discard servisi keser; kanıttaki port dağılımına göre dar FlowSpec önerilir. }
+
+  - id: udp_small_packet_flood
+    name: UDP Küçük Paket Flood (pps odaklı)
+    category: udp_flood
+    description: Ortalama 128 byte altı UDP paketleriyle yüksek pps; router/firewall paket işleme kapasitesini hedefler.
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [udp]
+      max_packet_size: 128
+    thresholds: { pps: 150k }
+    baseline: { enabled: true, factor: 6, min_pps: 30k }
+    conditions: { min_unique_sources: 20 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: scrub, rtbh_escalation: 0.8 }
+
+  - id: udp_quic_flood
+    name: UDP/443 (QUIC) Flood
+    category: udp_flood
+    description: Hedef portu UDP/443 olan paket seli; QUIC sunucularını hedefler.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [udp], dst_ports: ["443"] }
+    thresholds: { pps: 300k, bps: 2Gbps }
+    baseline: { enabled: true, factor: 5, min_pps: 50k, min_bps: 500Mbps }
+    conditions: { min_unique_sources: 50 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: scrub, note: QUIC meşru web trafiğidir; QUIC farkında scrubbing veya HTTP/3 kapatıp TCP'ye düşürme. }
+
+  - id: udp_dns_query_flood
+    name: DNS Sorgu Seli (hedef port 53)
+    category: udp_flood
+    description: Hedefin UDP/53 portuna yoğun sorgu; yetkili/özyinelemeli DNS sunucusunu tüketir. (Random-subdomain analizi L7 kapsamındadır.)
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [udp], dst_ports: ["53"] }
+    thresholds: { pps: 100k, bps: 300Mbps }
+    baseline: { enabled: true, factor: 5, min_pps: 20k }
+    conditions: { min_unique_sources: 50 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: scrub, note: DNS'i discard etmek servisi keser; DNS farkında scrubbing veya RRL (Response Rate Limiting). }
+
+  - id: icmp_echo_flood
+    name: ICMP Echo Request Flood (Ping Flood)
+    category: icmp_flood
+    description: ICMP Type 8 / ICMPv6 Type 128 seli.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [icmp, icmpv6]
+      icmp_types: [8, 128]
+    thresholds: { pps: 20k, bps: 100Mbps }
+    baseline: { enabled: true, factor: 10, min_pps: 5k }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 5Mbps, rtbh_escalation: 0.8, note: Ping teşhisini korumak için tamamen düşürmek yerine sınırlandırın. }
+
+  - id: icmp_echo_reply_flood
+    name: ICMP Echo Reply Flood (Smurf / Yansıtma)
+    category: icmp_flood
+    description: Hedefin göndermediği ping'lere ait istenmeyen Type 0 / ICMPv6 Type 129 cevapları.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [icmp, icmpv6]
+      icmp_types: [0, 129]
+    thresholds: { pps: 10k, bps: 50Mbps }
+    conditions: { min_unique_sources: 20 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 2Mbps, rtbh_escalation: 0.8 }
+
+  - id: icmp_unreachable_blacknurse
+    name: ICMP Destination Unreachable Flood (BlackNurse)
+    category: icmp_flood
+    description: ICMP Type 3 (özellikle Code 3) seli; düşük hacimde bile güvenlik duvarı CPU'sunu tüketir.
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [icmp]
+      icmp_types: [3]
+    thresholds: { pps: 5k, bps: 20Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 1Mbps, note: Type 3 Code 4 (Fragmentation Needed) PMTUD için gereklidir; tamamen düşürmeyin. }
+    references: ["BlackNurse (TDC SOC 2016)", "RFC 1191"]
+
+  - id: icmp_large_packets
+    name: Büyük ICMP Paketleri
+    category: icmp_flood
+    description: Ortalama 1000 byte üstü ICMP; bant genişliği tüketimi veya fragment üretimi.
+    direction: inbound
+    scope: host
+    severity: low
+    match:
+      protocols: [icmp, icmpv6]
+      min_packet_size: 1000
+    thresholds: { pps: 5k, bps: 50Mbps }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 2Mbps, packet_length: true }
+
+  - id: icmp_flood_generic
+    name: ICMP Flood (genel)
+    category: icmp_flood
+    description: Tüm ICMP/ICMPv6 tiplerinin toplamında eşik veya baseline aşımı.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [icmp, icmpv6] }
+    thresholds: { pps: 50k, bps: 200Mbps }
+    baseline: { enabled: true, factor: 10, min_pps: 10k }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 10Mbps, rtbh_escalation: 0.8 }

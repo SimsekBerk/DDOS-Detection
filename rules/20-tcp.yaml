@@ -1,0 +1,192 @@
+# TCP tabanlı L4 saldırılar (inbound, host kapsamı)
+#
+# Flow verisinde TCP flag'leri bir flow boyunca görülen flag'lerin VEYA'sıdır
+# (NetFlow/IPFIX tcpControlBits). Sahte kaynaklı floodlarda her kaynak genelde
+# tek paketlik bir flow üretir; bu yüzden "sadece SYN" flow'ları SYN flood'u,
+# "sadece ACK" flow'ları ACK flood'u temsil eder. sFlow'da flag'ler paket bazında
+# kesindir.
+#
+# En iyi uygulamalar:
+#   - SYN flood'u FlowSpec "discard" ile DURDURMAYIN: hedefe gelen tüm yeni
+#     bağlantılar da düşer, yani saldırganın amacına ulaşırsınız. Doğru yanıt
+#     SYN cookie/SYN proxy (scrubbing) veya oran sınırlamadır.
+#   - Geçersiz flag kombinasyonları (NULL, XMAS, SYN+FIN) RFC 793'e göre
+#     meşru olamaz; doğrudan düşürülebilir.
+#   - Küçük paket boyu koşulu (max_avg_packet_size) veri taşıyan meşru akışları
+#     ayıklar.
+
+rules:
+  - id: tcp_syn_flood
+    name: TCP SYN Flood
+    category: tcp_flood
+    description: ACK içermeyen SYN paketleri; bağlantı tablosunu (backlog) tüketmeye yönelik.
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [syn], none: [ack, rst, fin] }
+      max_packet_size: 120
+    thresholds: { pps: 50k, bps: 300Mbps }
+    baseline: { enabled: true, factor: 6, min_pps: 10k }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation:
+      action: scrub
+      rtbh_escalation: 0.8
+      note: Discard tüm yeni bağlantıları keser. SYN cookie/SYN proxy destekli scrubbing'e yönlendirin; geçici olarak FlowSpec rate-limit uygulanabilir.
+    rationale: Meşru SYN'ler yeni bağlantı oranıyla sınırlıdır; sahte kaynaklı SYN flood saniyede yüz binlerce benzersiz kaynak üretir.
+    references: ["RFC 4987"]
+
+  - id: tcp_synack_reflection
+    name: TCP SYN-ACK Reflection Flood
+    category: tcp_flood
+    description: Hedefin başlatmadığı bağlantılara ait istenmeyen SYN-ACK paketleri; sahte SYN'lere cevap veren sunucular üzerinden yansıtma.
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [syn, ack], none: [rst, fin] }
+      max_packet_size: 120
+    thresholds: { pps: 30k, bps: 200Mbps }
+    conditions: { min_unique_sources: 50 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 10Mbps, rtbh_escalation: 0.8, note: Sunucular SYN-ACK almaz; istemci blokları için profil ayarı gerekir. }
+    false_positives: NAT arkasında çok sayıda giden bağlantı açan istemci blokları (residential profili ölçeği yükseltir).
+
+  - id: tcp_ack_flood
+    name: TCP ACK Flood
+    category: tcp_flood
+    description: Sadece ACK flag'li küçük paketler; stateful cihazların oturum tablosu aramalarını tüketir.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [ack], none: [syn, fin, rst, psh] }
+      max_packet_size: 100
+    thresholds: { pps: 300k, bps: 1Gbps }
+    baseline: { enabled: true, factor: 6, min_pps: 50k }
+    conditions: { min_unique_sources: 100 }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: scrub, rtbh_escalation: 0.8, note: Meşru indirme trafiğinin ACK'leri ile karışır; durum takibi yapan scrubbing önerilir. }
+    false_positives: Büyük upload alan sunucular yoğun saf ACK gönderir (inbound tarafta görülmez); CDN önü sunucular için web profili.
+
+  - id: tcp_rst_flood
+    name: TCP RST Flood
+    category: tcp_flood
+    description: RST flag'li paket seli; oturum sonlandırma ve CPU tüketimi.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [rst] }
+    thresholds: { pps: 20k, bps: 100Mbps }
+    baseline: { enabled: true, factor: 8, min_pps: 5k }
+    conditions: { min_unique_sources: 20 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 5Mbps, rtbh_escalation: 0.8 }
+
+  - id: tcp_fin_flood
+    name: TCP FIN Flood (ACK'siz)
+    category: tcp_flood
+    description: ACK içermeyen FIN paketleri; meşru TCP'de FIN her zaman ACK ile gelir.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [fin], none: [ack] }
+    thresholds: { pps: 10k, bps: 50Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8, note: ACK'siz FIN RFC 793'e göre meşru değildir. }
+    references: ["RFC 793"]
+
+  - id: tcp_invalid_flags
+    name: TCP NULL Paketleri (flag yok)
+    category: tcp_flood
+    description: Hiç flag taşımayan TCP paketleri (NULL scan/flood).
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      tcp_flags: { empty: true }
+    thresholds: { pps: 5k, bps: 20Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, note: Flag'siz TCP paketi meşru olamaz. }
+    references: ["RFC 793"]
+
+  - id: tcp_xmas_synfin
+    name: TCP XMAS / SYN+FIN
+    category: tcp_flood
+    description: Aynı pakette çelişkili flag'ler (SYN+FIN veya FIN+PSH+URG).
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [fin], any: [syn, urg] }
+    thresholds: { pps: 2k, bps: 10Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard }
+
+  - id: tcp_psh_ack_flood
+    name: TCP PSH-ACK Flood
+    category: tcp_flood
+    description: Rastgele veri taşıyan PSH+ACK paketleri; oturum tablosu ve uygulama katmanı öncesi kaynakları tüketir.
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [psh, ack], none: [syn] }
+    thresholds: { pps: 500k, bps: 4Gbps }
+    baseline: { enabled: true, factor: 6, min_pps: 100k, min_bps: 1Gbps }
+    conditions: { min_unique_sources: 200 }
+    trigger: { sustain: 10s, hold_down: 60s }
+    mitigation: { action: scrub, rtbh_escalation: 0.8, note: Meşru veri trafiğine çok benzer; yalnızca baseline sapması ve çok kaynak birlikteyse tetiklenir. }
+
+  - id: tcp_conn_flood
+    name: TCP Bağlantı Seli (yeni flow oranı)
+    category: tcp_flood
+    description: Saniyedeki yeni TCP flow sayısında patlama; tamamlanmış el sıkışmalarıyla durum tablosu tüketimi. FPS yalnızca NetFlow/IPFIX'te anlamlıdır.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [tcp] }
+    thresholds: { fps: 30k }
+    baseline: { enabled: true, factor: 8, min_pps: 20k }
+    trigger: { sustain: 10s, hold_down: 60s }
+    mitigation: { action: scrub, note: Bağlantı sınırlama/rate-limit için scrubbing veya yük dengeleyici. }
+
+  - id: tcp_flood_generic
+    name: TCP Hacimsel Flood (genel)
+    category: tcp_flood
+    description: Hedefe gelen toplam TCP trafiğinde statik eşik ya da baseline aşımı.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [tcp] }
+    thresholds: { pps: 1M, bps: 5Gbps }
+    baseline: { enabled: true, factor: 5, min_pps: 100k, min_bps: 1Gbps }
+    conditions: { min_unique_sources: 50 }
+    trigger: { sustain: 10s, hold_down: 90s }
+    mitigation: { action: scrub, rtbh_escalation: 0.8 }
+
+  - id: infra_bgp_flood
+    name: BGP / Kontrol Düzlemi Flood
+    category: infrastructure
+    description: TCP/179 (BGP), 22 (SSH), 830 (NETCONF) hedefli paket seli; router kontrol düzlemini hedefler.
+    direction: inbound
+    scope: host
+    severity: critical
+    match:
+      protocols: [tcp]
+      dst_ports: ["179", "22", "830"]
+    thresholds: { pps: 5k, bps: 20Mbps }
+    conditions: { min_unique_sources: 5 }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: alert, note: Kontrol düzlemi için iACL/CoPP uygulayın; BGP için GTSM (RFC 5082) ve TCP-AO/MD5. FlowSpec ile oturumu kesme riskini almayın. }
+    references: ["RFC 5082", "RFC 6192"]

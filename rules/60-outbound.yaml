@@ -1,0 +1,86 @@
+# Outbound (giden) saldırılar: korunan ağınızdan çıkan saldırı trafiği
+#
+# Neden önemli:
+#   - Ele geçirilmiş sunucular/IoT cihazlar botnet'e katılarak saldırı üretir.
+#   - Açık servisleriniz (DNS, NTP, memcached...) başkalarına karşı yansıtıcı
+#     olarak kullanılır; bu hem itibar (blocklist) hem de upstream bant
+#     genişliği maliyeti demektir.
+#   - Flow tabanlı dedektörlerin çoğu bunu kaçırır; burada hedef anahtar
+#     KAYNAK hosttur, benzersiz sayım ise farklı HEDEF sayısıdır.
+#
+# En iyi uygulama: Outbound'da mitigasyon kaynağa yönelik olur (FlowSpec
+# source <host>/32). Ayrıca BCP38/uRPF ile sahte kaynaklı paketlerin ağınızdan
+# çıkmasını router seviyesinde engelleyin.
+
+rules:
+  - id: out_reflector_dns
+    name: Açık DNS Yansıtıcı (outbound)
+    category: outbound
+    description: Korunan bir hostun çok sayıda farklı hedefe büyük DNS cevapları göndermesi; açık resolver olarak istismar ediliyor.
+    direction: outbound
+    scope: host
+    severity: high
+    match:
+      protocols: [udp]
+      src_ports: ["53"]
+      min_packet_size: 512
+    thresholds: { pps: 10k, bps: 100Mbps }
+    baseline: { enabled: true, factor: 8, min_pps: 2k }
+    conditions: { min_unique_sources: 5 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-rate-limit, rate: 10Mbps, packet_length: true, note: Resolver'ı yalnızca kendi müşterilerinize açın; RRL uygulayın. }
+
+  - id: out_reflector_misc
+    name: Açık UDP Yansıtıcı (NTP/SSDP/memcached/CLDAP/SNMP/CharGEN)
+    category: outbound
+    description: Korunan bir hostun yansıtma portlarından dışarıya yoğun cevap üretmesi.
+    direction: outbound
+    scope: host
+    severity: high
+    match:
+      protocols: [udp]
+      src_ports: ["123", "1900", "11211", "389", "161", "19", "17", "3702", "5683", "427", "37810", "10001"]
+    thresholds: { pps: 5k, bps: 50Mbps }
+    conditions: { min_unique_sources: 3 }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-discard, note: Servisi internete kapatın; geçici olarak çıkışta düşürülür. }
+
+  - id: out_udp_flood
+    name: Outbound UDP Flood (botnet şüphesi)
+    category: outbound
+    description: Korunan bir hosttan dışarıya yüksek pps UDP.
+    direction: outbound
+    scope: host
+    severity: high
+    match: { protocols: [udp] }
+    thresholds: { pps: 100k, bps: 800Mbps }
+    baseline: { enabled: true, factor: 10, min_pps: 20k }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-rate-limit, rate: 10Mbps, note: Host muhtemelen ele geçirilmiş; abuse ekibine bildirin. }
+
+  - id: out_syn_flood
+    name: Outbound SYN Flood
+    category: outbound
+    description: Korunan bir hosttan dışarıya yoğun SYN (saldırı veya agresif tarama).
+    direction: outbound
+    scope: host
+    severity: high
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [syn], none: [ack] }
+    thresholds: { pps: 20k }
+    baseline: { enabled: true, factor: 10, min_pps: 5k }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-rate-limit, rate: 5Mbps }
+
+  - id: out_icmp_flood
+    name: Outbound ICMP Flood
+    category: outbound
+    description: Korunan bir hosttan dışarıya yoğun ICMP.
+    direction: outbound
+    scope: host
+    severity: medium
+    match: { protocols: [icmp, icmpv6] }
+    thresholds: { pps: 20k, bps: 100Mbps }
+    trigger: { sustain: 5s, hold_down: 120s }
+    mitigation: { action: flowspec-rate-limit, rate: 2Mbps }

@@ -1,0 +1,93 @@
+# Fragment ve IP protokolü floodları (inbound, host kapsamı)
+#
+# Fragment'lar: Sonraki fragment'larda L4 başlığı yoktur; flow exporter'lar bu
+# kayıtları port 0/0 ile raporlar. Büyük amplifikasyon cevapları (DNS, NTP,
+# memcached) fragment'lara bölündüğünden, amplifikasyon saldırılarında bu kurallar
+# da tetiklenir; bu beklenen çok vektörlü davranıştır.
+#
+# IP protokol floodları: GRE/ESP/IP-in-IP ve alışılmadık protokoller sıklıkla
+# ACL'lerde unutulur. Tünel uç noktalarını vpn_gateway profiline alın.
+
+rules:
+  - id: udp_fragment_flood
+    name: UDP Fragment Flood
+    category: fragment
+    description: UDP fragment'ları (port bilgisi olmayan sonraki parçalar); yeniden birleştirme kaynaklarını ve bant genişliğini tüketir.
+    direction: inbound
+    scope: host
+    severity: high
+    match:
+      protocols: [udp]
+      fragment: true
+    thresholds: { pps: 20k, bps: 200Mbps }
+    baseline: { enabled: true, factor: 8, min_pps: 5k, min_bps: 50Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation:
+      action: flowspec-rate-limit
+      rate: 50Mbps
+      rtbh_escalation: 0.8
+      note: Fragment'ları tamamen düşürmek büyük EDNS/VPN paketlerini bozabilir; oran sınırlama önerilir.
+
+  - id: tcp_fragment
+    name: TCP Fragment'ları
+    category: fragment
+    description: Parçalanmış TCP; modern yığınlarda PMTUD sayesinde neredeyse hiç görülmez (Teardrop benzeri ve atlatma amaçlı).
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      protocols: [tcp]
+      fragment: true
+    thresholds: { pps: 2k, bps: 20Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard }
+
+  - id: fragment_flood_any
+    name: IP Fragment Flood (tüm protokoller)
+    category: fragment
+    description: Protokolden bağımsız fragment hacmi (ICMP ping-of-death türevleri, GRE fragment'ları vb.).
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { fragment: true }
+    thresholds: { pps: 40k, bps: 400Mbps }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 50Mbps, rtbh_escalation: 0.8 }
+
+  - id: gre_flood
+    name: GRE Flood
+    category: ip_protocol
+    description: IP protokol 47 seli; GRE kapsüllü rastgele yük (Mirai GRE-ETH/GRE-IP).
+    direction: inbound
+    scope: host
+    severity: high
+    match: { protocols: [gre] }
+    thresholds: { pps: 20k, bps: 200Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, rtbh_escalation: 0.8, note: Tünel uç noktası değilse GRE meşru değildir. }
+
+  - id: esp_flood
+    name: ESP / AH Flood
+    category: ip_protocol
+    description: IPsec protokolleri (50/51) üzerinden paket seli.
+    direction: inbound
+    scope: host
+    severity: medium
+    match: { protocols: [esp, ah] }
+    thresholds: { pps: 20k, bps: 200Mbps }
+    baseline: { enabled: true, factor: 8, min_pps: 5k }
+    trigger: { sustain: 5s, hold_down: 60s }
+    mitigation: { action: flowspec-rate-limit, rate: 20Mbps }
+
+  - id: ipproto_unusual
+    name: Alışılmadık IP Protokolü Flood
+    category: ip_protocol
+    description: TCP/UDP/ICMP/GRE/ESP/AH dışındaki protokoller (IP-in-IP, IGMP, protokol 0/255 vb.).
+    direction: inbound
+    scope: host
+    severity: medium
+    match:
+      not_protocols: [tcp, udp, icmp, icmpv6, gre, esp, ah]
+    thresholds: { pps: 5k, bps: 50Mbps }
+    trigger: { sustain: 3s, hold_down: 60s }
+    mitigation: { action: flowspec-discard, note: FlowSpec kanıttaki baskın protokol numarasıyla oluşturulur. }

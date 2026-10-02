@@ -1,0 +1,42 @@
+# Kendi ağınızda çalıştırmak için:
+#   cp config.example.yaml config.yaml   (prefixleri düzenleyin)
+#   docker compose -f deploy/docker-compose.yml up -d
+# Sadece demo için:
+#   DDOSD_CONFIG=config.demo.yaml docker compose -f deploy/docker-compose.yml up
+#
+# ExaBGP ile FlowSpec/RTBH duyurmak için "bgp" profilini açın:
+#   docker compose -f deploy/docker-compose.yml --profile bgp up -d
+# ve config.yaml'da mitigation.driver: exabgp, command_file: /var/run/ddosd/exabgp.cmd
+
+services:
+  ddosd:
+    build: ..
+    image: ddosd:local
+    restart: unless-stopped
+    command: ["-config", "/app/${DDOSD_CONFIG:-config.yaml}"]
+    ports:
+      - "2055:2055/udp"   # NetFlow v5/v9 (+IPFIX/sFlow otomatik)
+      - "4739:4739/udp"   # IPFIX
+      - "6343:6343/udp"   # sFlow
+      - "8080:8080"       # Web UI / API (config.demo.yaml 8090 kullanır)
+      - "8090:8090"
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - ../rules:/app/rules:ro
+      - ddosd-data:/data
+      - exabgp-cmd:/var/run/ddosd
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+
+  exabgp:
+    profiles: ["bgp"]
+    image: mikenowak/exabgp:latest
+    restart: unless-stopped
+    network_mode: host      # BGP oturumu router'a doğrudan kurulur (TCP/179)
+    volumes:
+      - ./exabgp/exabgp.conf:/etc/exabgp/exabgp.conf:ro
+      - exabgp-cmd:/var/run/ddosd
+
+volumes:
+  ddosd-data:
+  exabgp-cmd:

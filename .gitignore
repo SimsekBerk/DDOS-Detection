@@ -1,0 +1,17 @@
+# build output
+/bin/
+web/node_modules/
+
+# runtime state
+/data/
+/data-demo/
+*.tmp
+
+# local configuration (copy from config.example.yaml)
+/config.yaml
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+web/tsconfig.tsbuildinfo

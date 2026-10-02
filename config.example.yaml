@@ -1,0 +1,116 @@
+# ddosd yapılandırması — kendi ağınız için şablon
+# Kopyalayın: cp config.example.yaml config.yaml
+
+# ---------------------------------------------------------------------------
+# Flow toplama
+# ---------------------------------------------------------------------------
+collector:
+  # Tüm portlar NetFlow v5/v9, IPFIX ve sFlow'u otomatik tanır; ayrı portlar
+  # yalnızca alışkanlık/ACL kolaylığı içindir.
+  listen: [":2055", ":4739", ":6343"]
+  read_buffer_bytes: 16777216     # Linux'ta net.core.rmem_max en az bu kadar olmalı
+  queue_size: 8192                # collector → engine batch kuyruğu
+  default_sampling_rate: 1        # exporter örnekleme bildirmezse kullanılır
+
+# Exporter (router) bazlı ayarlar. Router örnekleme oranını flow içinde
+# göndermiyorsa (ör. bazı sFlow/NetFlow v5 kurulumları) buradan zorlayın.
+exporters:
+  # - address: 10.0.0.1
+  #   name: edge-ist-01
+  #   sampling_rate: 1000
+
+# ---------------------------------------------------------------------------
+# Korunan nesneler (müşteri / blok / servis grupları)
+# ---------------------------------------------------------------------------
+# profile: rules/00-profiles.yaml içindeki profillerden biri
+#   default | residential | datacenter | web | dns_server | gaming | vpn_gateway | infrastructure
+# link_capacity: RTBH eskalasyonu ve kullanım yüzdesi için
+protected_objects:
+  - name: Musteri-A
+    prefixes: ["203.0.113.0/24", "2001:db8:a::/48"]
+    profile: web
+    link_capacity: 10Gbps
+    carpet_prefix_v4: 24
+    carpet_prefix_v6: 64
+    notes: "E-ticaret önyüzü, TCP/443 + QUIC"
+
+  - name: DNS-Sunuculari
+    prefixes: ["198.51.100.53/32", "198.51.100.54/32"]
+    profile: dns_server
+    link_capacity: 1Gbps
+
+  - name: Router-Loopback
+    prefixes: ["192.0.2.0/28"]
+    profile: infrastructure
+
+rules_dir: rules
+data_dir: data
+
+# ---------------------------------------------------------------------------
+# Algılama motoru
+# ---------------------------------------------------------------------------
+engine:
+  window: 10s               # kayan pencere (sFlow için 5-10s, NetFlow için 10-15s)
+  max_flow_spread: 30s      # uzun flow'lar bu süreye kadar zamana yayılır
+  recent_flows: 500000      # adli inceleme için bellekte tutulan son flow sayısı
+  baseline_tau: 30m         # EWMA zaman sabiti
+  baseline_learn: 10m       # baseline tetikleri bu süre öğrenmeden sonra aktif
+  near_miss_ratio: 0.5      # eşiğin %50'si üstü aday sinyal
+  signal_min_z: 4           # baseline sapması için z-skoru
+  signal_min_pps: 2000
+  signal_min_bps: 20Mbps
+  incident_reopen: 2m       # olay bittikten sonra bu sürede tekrar tetiklenirse aynı olay açılır
+  evidence_every: 10s
+
+# ---------------------------------------------------------------------------
+# Mitigasyon
+# ---------------------------------------------------------------------------
+mitigation:
+  mode: manual              # manual: onay ister | auto: bariyerlerden geçeni uygular (RTBH hariç) | off
+  driver: dryrun            # dryrun | exabgp | webhook
+  default_ttl: 30m
+  withdraw_after: 5m        # olay bittikten sonra kuralın geri çekilmesi için sessiz süre
+  max_active: 50
+  min_prefix_v4: 24         # FlowSpec hedefi bundan geniş olamaz
+  min_prefix_v6: 48
+  allow_rtbh: false         # RTBH önerilerine izin ver (her zaman manuel onay)
+  never_mitigate:           # bu adreslere ASLA otomatik/önerilen kural uygulanmaz
+    - 198.51.100.53/32      # kendi resolver'larınız
+    - 192.0.2.1/32          # router loopback
+  exabgp:
+    command_file: /var/run/ddosd/exabgp.cmd
+    rtbh_next_hop: 192.0.2.1
+    rtbh_community: "65535:666"
+  webhook:
+    url: ""                 # scrubbing/SOAR entegrasyonu
+    secret: ""              # X-DDoS-Signature: sha256=HMAC(body)
+
+# ---------------------------------------------------------------------------
+# AI analist
+# ---------------------------------------------------------------------------
+analyst:
+  enabled: true
+  provider: heuristic       # heuristic (LLM yok) | anthropic (ANTHROPIC_API_KEY) | openai_compat (yerel LLM)
+  model: claude-opus-5-5    # anthropic için
+  effort: high              # low | medium | high | xhigh | max
+  interval: 5m              # zamanlanmış analiz; bekleyen sinyal yoksa model çağrılmaz
+  auto_run: true
+  language: tr
+  max_turns: 12
+  max_tokens: 16000
+  openai_compat:
+    base_url: http://localhost:11434/v1   # Ollama; vLLM için http://host:8000/v1
+    model: ""                             # ör. qwen3:32b, gpt-oss:20b
+    api_key_env: ""
+
+# ---------------------------------------------------------------------------
+# Web UI / API
+# ---------------------------------------------------------------------------
+api:
+  listen: ":8080"
+  username: admin
+  password: ""              # ağa açıyorsanız MUTLAKA ayarlayın (basic auth)
+
+# Demo simülatörü kapalı (gerçek ağ)
+demo:
+  enabled: false
