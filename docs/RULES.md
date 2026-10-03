@@ -35,7 +35,8 @@
    - ICMP ve fragment için tamamen kapatmak yerine **rate-limit** uygulanır, çünkü PMTUD ve EDNS bunlara ihtiyaç duyar.
    - RTBH yalnızca host kapsamında, bağlantı kapasitesinin belirli bir yüzdesi aşıldığında ve her zaman manuel onayla uygulanır.
 8. **Profil.** Tek bir global eşik hem bir DNS resolver'ı hem de bir ev kullanıcısı için doğru olamaz. Nesne tipine göre profil seçin; kural bazlı istisnalar profil içinde tanımlanır.
-9. **Açıklanabilirlik.** Her kuralda `rationale`, `false_positives` ve `references` alanları bulunur. Olay ekranında tetik nedeni ölçümüyle birlikte gösterilir, örneğin "bps 649Mbps ≥ eşik 400Mbps".
+9. **Flow bayrak semantiği.** NetFlow/IPFIX kayıtlarında TCP bayrakları bağlantı boyunca birleşir (OR); sFlow ise tek tek paket örnekler. Tamamlanmış normal bir bağlantı `SYN|ACK|PSH|FIN` görünür. Bayrak tabanlı kurallar bu yüzden saldırının *taşımadığı* bayrakları da belirtir: sahte SYN, XMAS ve FIN paketleri ACK taşımaz, RST seli SYN/PSH taşımaz, yansıtılan SYN-ACK veri (PSH) taşımaz. `TestNormalConnectionFlagsAreNotAttacks` testi normal bağlantı bayraklarının hiçbir saldırı kuralına uymadığını doğrular.
+10. **Açıklanabilirlik.** Her kuralda `rationale`, `false_positives` ve `references` alanları bulunur. Olay ekranında tetik nedeni ölçümüyle birlikte gösterilir, örneğin "bps 649Mbps ≥ eşik 400Mbps".
 
 ## Kural şeması
 
@@ -118,12 +119,12 @@ HTTP flood'lar, Slowloris/RUDY, TLS renegotiation, DNS water torture (rastgele a
 | Kural | Eşleşme | Kapsam | Eşik (temel) | Baseline | Koşullar | Sustain / hold | Aksiyon |
 |---|---|---|---|---|---|---|---|
 | `tcp_syn_flood`<br>TCP SYN Flood | `proto=tcp tcp=+syn !ack!rst!fin pkt<=120` | inbound/host | 50kpps · 300Mbps | ×6 (min 10kpps) | — | 3s / 60s | Scrubbing (RTBH eskalasyon %80) |
-| `tcp_synack_reflection`<br>TCP SYN-ACK Reflection Flood | `proto=tcp tcp=+syn+ack !rst!fin pkt<=120` | inbound/host | 30kpps · 200Mbps | — | ≥50 kaynak | 3s / 60s | FlowSpec rate-limit 10Mbps (RTBH eskalasyon %80) |
+| `tcp_synack_reflection`<br>TCP SYN-ACK Reflection Flood | `proto=tcp tcp=+syn+ack !rst!fin!psh pkt<=120` | inbound/host | 30kpps · 200Mbps | — | ≥50 kaynak | 3s / 60s | FlowSpec rate-limit 10Mbps (RTBH eskalasyon %80) |
 | `tcp_ack_flood`<br>TCP ACK Flood | `proto=tcp tcp=+ack !syn!fin!rst!psh pkt<=100` | inbound/host | 300kpps · 1Gbps | ×6 (min 50kpps) | ≥100 kaynak | 5s / 60s | Scrubbing (RTBH eskalasyon %80) |
-| `tcp_rst_flood`<br>TCP RST Flood | `proto=tcp tcp=+rst` | inbound/host | 20kpps · 100Mbps | ×8 (min 5kpps) | ≥20 kaynak | 3s / 60s | FlowSpec rate-limit 5Mbps (RTBH eskalasyon %80) |
+| `tcp_rst_flood`<br>TCP RST Flood | `proto=tcp tcp=+rst !syn!psh` | inbound/host | 20kpps · 100Mbps | ×8 (min 5kpps) | ≥20 kaynak | 3s / 60s | FlowSpec rate-limit 5Mbps (RTBH eskalasyon %80) |
 | `tcp_fin_flood`<br>TCP FIN Flood (ACK'siz) | `proto=tcp tcp=+fin !ack` | inbound/host | 10kpps · 50Mbps | — | — | 3s / 60s | FlowSpec discard (RTBH eskalasyon %80) |
 | `tcp_invalid_flags`<br>TCP NULL Paketleri (flag yok) | `proto=tcp tcp=none` | inbound/host | 5kpps · 20Mbps | — | — | 3s / 60s | FlowSpec discard |
-| `tcp_xmas_synfin`<br>TCP XMAS / SYN+FIN | `proto=tcp tcp=+fin any(syn,urg)` | inbound/host | 2kpps · 10Mbps | — | — | 3s / 60s | FlowSpec discard |
+| `tcp_xmas_synfin`<br>TCP XMAS / SYN+FIN | `proto=tcp tcp=+fin !ack any(syn,urg)` | inbound/host | 2kpps · 10Mbps | — | — | 3s / 60s | FlowSpec discard |
 | `tcp_psh_ack_flood`<br>TCP PSH-ACK Flood | `proto=tcp tcp=+psh+ack !syn` | inbound/host | 500kpps · 4Gbps | ×6 (min 100kpps / 1Gbps) | ≥200 kaynak | 10s / 60s | Scrubbing (RTBH eskalasyon %80) |
 | `tcp_conn_flood`<br>TCP Bağlantı Seli (yeni flow oranı) | `proto=tcp tcp=+syn+ack any(psh,fin)` | inbound/host | 30kfps | — | — | 10s / 60s | Scrubbing |
 | `tcp_flood_generic`<br>TCP Hacimsel Flood (genel) | `proto=tcp` | inbound/host | 1Mpps · 5Gbps | ×5 (min 100kpps / 1Gbps) | ≥50 kaynak | 10s / 90s | Scrubbing (RTBH eskalasyon %80) |

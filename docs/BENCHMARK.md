@@ -25,7 +25,7 @@
 
 `ddos-bench detect` her senaryoyu her telemetri modunda ayrı bir motor örneğiyle çalıştırır:
 
-1. **Isınma (7 dk):** 600 Mbps normal trafik (web, DNS, NTP, QUIC, ICMP, giden trafik karışımı; 10 dakikalık dalga). Baseline bu sürede öğrenilir.
+1. **Isınma (7 dk):** 600 Mbps normal trafik (web, DNS, NTP, QUIC, ICMP, giden trafik karışımı; 10 dakikalık dalga). TCP flow'ları gerçek router export'larındaki gibi bağlantı boyunca birleştirilmiş bayraklar taşır: tamamlanmış (`SYN|ACK|PSH|FIN`), uzun süren (`SYN|ACK|PSH`, `ACK|PSH`), RST ile kesilen ve ECN'li bağlantılar. Baseline bu sürede öğrenilir.
 2. **Saldırı (90 sn):** senaryonun trafiği normal trafiğe eklenir.
 3. **Soğuma (4 dk):** yalnızca normal trafik; olayın kapanması beklenir.
 
@@ -70,7 +70,7 @@ Trafik gerçek NetFlow v9 / IPFIX / sFlow paketleri olarak kodlanır, gerçek de
 
 - Yanlış hedefte olay: **0**.
 - Olay bitişi kuralın `hold_down` süresinden (60–120 sn) gelir; bu, kısa aralarla tekrar eden saldırılarda olayın çırpınmasını önlemek için bilinçli bir tercihtir.
-- 96 saldırı koşusunun 11'inde aynı olaya ek olarak genel bir vektör (`udp_flood_host` veya `total_host`) eklendi: CLDAP ve memcached'de port bilgisi taşımayan fragment'lar, ACK flood'da ise ACK kuralına uymayan trafik özel vektörlerce açıklanamadığı için. Ayrı olay açılmaz.
+- 96 saldırı koşusunun 12'sinde aynı olaya ek olarak genel bir vektör (`udp_flood_host`, `total_host` veya `amp_generic_lowport`) eklendi: CLDAP ve memcached'de port bilgisi taşımayan fragment'lar, ACK flood'da ise ACK kuralına uymayan trafik özel vektörlerce açıklanamadığı için. Ayrı olay açılmaz.
 
 Senaryo bazında algılama süresi (sn):
 
@@ -108,10 +108,10 @@ Senaryo bazında algılama süresi (sn):
 | Telemetri | Koşu | Süre | Yanlış olay | Aday sinyal |
 |---|---|---|---|---|
 | sFlow 1:1000 | 6 faz | 12 saat | 0 | 0 |
-| IPFIX 1:1 (10s/15s) | 6 faz | 12 saat | 0 | 0 |
+| IPFIX 1:1 (10s/15s) | 6 faz | 12 saat | 0 | 1 |
 | NetFlow v9 1:1000 (10s/15s) | 6 faz | 12 saat | 0 | 0 |
-| NetFlow v9 1:1 (60s/15s) | 6 faz | 12 saat | 0 | 3 (tek koşuda) |
-| **Toplam** | 24 | **48 saat** | **0** | **3** |
+| NetFlow v9 1:1 (60s/15s) | 6 faz | 12 saat | 0 | 0 |
+| **Toplam** | 24 | **48 saat** | **0** | **1** |
 
 Aday sinyaller olay değildir; AI analistin incelemesi için kuyruğa düşer. Normal trafikteki rastgelelik nedeniyle tekrarlarda 48 saatte 1–3 sinyal görülür.
 
@@ -149,6 +149,7 @@ Bu benchmark yalnızca ölçüm için değil, ürünü düzeltmek için kullanı
 | Uçtan uca kayıp | 1M kayıt/sn'de kayıp | Sınıflandırma collector worker'larına taşındı, toplu gönderim | 2M kayıt/sn'de %0 |
 | Ayar ekranı (tarayıcı testi) | Kural eşiği ters gösteriliyordu; syslog testi protokolsüz başarısız; yeni token listede görünmüyordu; geri alınan değişiklikte "yeniden başlatma gerekli" kalıyordu | Hepsi düzeltildi, API testleri eklendi | |
 | Arayüz taşmaları | 1024 px'te tablolar ve KPI değerleri, mobilde mitigasyon kartları ekrandan taşıyordu | Tablo/kart düzeni; 375 / 768 / 1024 / 1440 px'te otomatik taşma taraması | 22 sayfada taşma yok |
+| Normal bağlantılar "TCP XMAS" saldırısı sanılıyordu | Gerçek trafikle preprod testinde bulundu: flow kayıtlarında bayraklar bağlantı boyunca birleşir, tamamlanmış bir HTTPS bağlantısı `SYN\|ACK\|PSH\|FIN` görünür ve SYN+FIN kuralına uyar. Simülatörün normal trafiği gerçekçi bayraklarla üretilince benchmark da 8 saatte 259 sahte olay gösterdi | `tcp_xmas_synfin` (ACK yok), `tcp_rst_flood` (SYN/PSH yok) ve `tcp_synack_reflection` (PSH yok) kuralları gerçek saldırı imzasına göre daraltıldı; simülatörün normal trafiği gerçekçi bayraklar taşıyor; regresyon testi eklendi | 259 → 0 sahte olay; 108/108 korundu |
 | Docker'da ayar kaydedilemiyordu | Yapılandırma salt okunur tek dosya olarak bağlıydı; `data_dir` volume'a gitmiyordu | Yazılabilir yapılandırma dizini, yerinde yazma geri dönüşü, arayüzde uyarı | |
 
 ---

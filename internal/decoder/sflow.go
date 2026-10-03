@@ -200,6 +200,12 @@ func decodeSFlowFlowSample(res *Result, exporter netip.Addr, body []byte, expand
 	}
 }
 
+// ParseEthernet decodes a captured Ethernet frame (VLAN/MPLS/IPv4/IPv6 and
+// the L4 header) into r. Packets and Bytes are left to the caller.
+func ParseEthernet(r *flow.Record, frame []byte) bool {
+	return parsePacket(r, sflowHeaderEthernet, frame)
+}
+
 // parsePacket decodes Ethernet/VLAN/MPLS/IPv4/IPv6 + L4 headers into r.
 func parsePacket(r *flow.Record, proto uint32, b []byte) bool {
 	var etype uint16

@@ -172,3 +172,40 @@ func TestDisjointRelation(t *testing.T) {
 		t.Error("total_host should be broader than udp_flood_host")
 	}
 }
+
+// Flow exports carry the OR of all TCP flags of a connection. Ordinary
+// connections must not look like flag-based attacks (regression: a complete
+// HTTPS connection, SYN|ACK|PSH|FIN, matched the XMAS/SYN-FIN rule).
+func TestNormalConnectionFlagsAreNotAttacks(t *testing.T) {
+	s := load(t)
+	const syn, ack, psh, fin, rst = flow.TCPSyn, flow.TCPAck, flow.TCPPsh, flow.TCPFin, flow.TCPRst
+	normal := map[string]uint8{
+		"complete":     syn | ack | psh | fin,
+		"long, first":  syn | ack | psh,
+		"long, later":  ack | psh,
+		"aborted":      syn | ack | psh | rst,
+		"ecn":          syn | ack | psh | fin | flow.TCPEce | flow.TCPCwr,
+		"no data":      syn | ack | fin,
+		"closed + rst": syn | ack | psh | fin | rst,
+	}
+	// Volume rules that match data traffic by design (high thresholds).
+	volumetric := map[string]bool{"tcp_psh_ack_flood": true, "tcp_conn_flood": true, "tcp_flood_generic": true, "total_host": true, "total_object": true}
+	for name, flags := range normal {
+		r := rec(flow.ProtoTCP, 50000, 443, flags, 10, 6000)
+		for _, c := range s.Rules {
+			if c.Direction == "inbound" && !volumetric[c.ID] && c.Matches(r) {
+				t.Errorf("normal %s connection (flags %08b) matches attack rule %s", name, flags, c.ID)
+			}
+		}
+	}
+	// The attack signatures themselves still match.
+	for id, flags := range map[string]uint8{
+		"tcp_xmas_synfin":       fin | psh | flow.TCPUrg,
+		"tcp_rst_flood":         rst | ack,
+		"tcp_synack_reflection": syn | ack,
+	} {
+		if !s.ByID[id].Matches(rec(flow.ProtoTCP, 443, 50000, flags, 1, 60)) {
+			t.Errorf("%s no longer matches its attack signature %08b", id, flags)
+		}
+	}
+}

@@ -22,10 +22,24 @@ type Spec struct {
 	ICMPCode         uint8
 	Packets          uint64 // real (unsampled) packets in this second
 	PktSize          uint16 // average packet size in bytes
-	Fragment         bool
+	// Bytes is the exact (unsampled) byte count when known (e.g. from a
+	// packet probe); 0 = Packets × PktSize.
+	Bytes uint64
+	// Probe marks flows measured from real packets: the synthetic interface
+	// indexes and AS numbers used by the simulator are not written.
+	Probe    bool
+	Fragment bool
 	// DurationMs is the flow duration reported by NetFlow/IPFIX encoders
 	// (0 = 1000 ms). Used to emulate exporter active/inactive timeouts.
 	DurationMs uint32
+}
+
+// byteCount scales the flow's bytes to p exported (sampled) packets.
+func (s Spec) byteCount(p uint64) uint64 {
+	if s.Bytes > 0 && s.Packets > 0 {
+		return s.Bytes * p / s.Packets
+	}
+	return p * uint64(s.PktSize)
 }
 
 func (s Spec) duration() uint32 {
@@ -103,7 +117,7 @@ func (e *nf5Encoder) Encode(specs []Spec, now time.Time) [][]byte {
 		binary.BigEndian.PutUint16(r[12:14], 1)
 		binary.BigEndian.PutUint16(r[14:16], 2)
 		binary.BigEndian.PutUint32(r[16:20], uint32(p))
-		binary.BigEndian.PutUint32(r[20:24], uint32(p*uint64(s.PktSize)))
+		binary.BigEndian.PutUint32(r[20:24], uint32(s.byteCount(p)))
 		binary.BigEndian.PutUint32(r[24:28], uptime-s.duration())
 		binary.BigEndian.PutUint32(r[28:32], uptime)
 		sp, dp := ports(s)
@@ -166,12 +180,16 @@ func encodeCommon(b []byte, s Spec, p uint64) []byte {
 	b = binary.BigEndian.AppendUint16(b, sp)
 	b = binary.BigEndian.AppendUint16(b, dp)
 	b = append(b, s.Proto, s.TCPFlags, 0)
-	b = binary.BigEndian.AppendUint64(b, p*uint64(s.PktSize))
+	b = binary.BigEndian.AppendUint64(b, s.byteCount(p))
 	b = binary.BigEndian.AppendUint64(b, p)
-	b = binary.BigEndian.AppendUint32(b, 1)
-	b = binary.BigEndian.AppendUint32(b, 2)
-	b = binary.BigEndian.AppendUint32(b, 64500)
-	b = binary.BigEndian.AppendUint32(b, 64501)
+	inIf, outIf, srcAS, dstAS := uint32(1), uint32(2), uint32(64500), uint32(64501)
+	if s.Probe {
+		inIf, outIf, srcAS, dstAS = 0, 0, 0, 0
+	}
+	b = binary.BigEndian.AppendUint32(b, inIf)
+	b = binary.BigEndian.AppendUint32(b, outIf)
+	b = binary.BigEndian.AppendUint32(b, srcAS)
+	b = binary.BigEndian.AppendUint32(b, dstAS)
 	return b
 }
 

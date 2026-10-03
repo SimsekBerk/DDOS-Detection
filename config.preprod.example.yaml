@@ -1,0 +1,54 @@
+# Preprod şablonu: bu makinenin bağlı olduğu gerçek ağ.
+#   cp config.preprod.example.yaml config.preprod.yaml   (alt ağ ve ağ geçidini düzenleyin)
+#   Alt ağı öğrenmek için: route -n get default; ifconfig en0
+#
+# Flow kaynakları:
+#   1) Bu makinenin kendi trafiği — ddos-probe (pasif paket sensörü, macOS):
+#        ./bin/ddos-probe -i en0 -collector 127.0.0.1:9995
+#   2) Tüm ağ — ağ geçidinin/firewall'un NetFlow/IPFIX/sFlow export'u bu
+#      makinenin IP'sine, UDP 9995'e yönlendirilirse (ağ yöneticisi yetkisi gerekir).
+#
+#   ./bin/ddosd -config config.preprod.yaml   →  http://127.0.0.1:8092
+#   Giriş: admin, parola data-preprod/initial-admin-password.txt
+
+collector:
+  listen: [":9995"]               # NetFlow v5/v9, IPFIX ve sFlow otomatik tanınır
+  default_sampling_rate: 1
+  allow:
+    - 127.0.0.1                   # yerel ddos-probe
+    - 192.168.1.1                 # ağ geçidi (router export açılırsa)
+
+protected_objects:
+  - name: LAN
+    prefixes: ["192.168.1.0/24"]  # bağlı olunan alt ağ
+    profile: residential          # istemci ağı: sunucu servisi beklenmez
+    link_capacity: 1Gbps
+    carpet_prefix_v4: 24
+    notes: "Bağlı olunan ağ"
+
+rules_dir: rules
+data_dir: data-preprod
+
+engine:
+  window: 10s
+  baseline_tau: 30m
+  baseline_learn: 10m             # gerçek trafik: 10 dk öğrenme
+
+mitigation:
+  mode: manual                    # yalnızca tespit; öneriler onay kuyruğuna düşer
+  driver: dryrun                  # hiçbir kural router'a gönderilmez
+  allow_rtbh: false
+  never_mitigate: ["192.168.1.1/32"]
+
+analyst:
+  enabled: true
+  provider: heuristic
+  auto_run: true
+  interval: 5m
+
+api:
+  listen: "127.0.0.1:8092"        # arayüz yalnızca bu makineden erişilebilir
+  username: admin
+
+demo:
+  enabled: false

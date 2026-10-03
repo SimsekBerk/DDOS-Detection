@@ -46,7 +46,9 @@ rules:
     severity: high
     match:
       protocols: [tcp]
-      tcp_flags: { all: [syn, ack], none: [rst, fin] }
+      # Uzun bir bağlantının ilk export'u SYN|ACK|PSH görünür; yansıtılan
+      # SYN-ACK'ler veri (PSH) taşımaz.
+      tcp_flags: { all: [syn, ack], none: [rst, fin, psh] }
       max_packet_size: 120
     thresholds: { pps: 30k, bps: 200Mbps }
     conditions: { min_unique_sources: 50 }
@@ -81,7 +83,9 @@ rules:
     severity: medium
     match:
       protocols: [tcp]
-      tcp_flags: { all: [rst] }
+      # RST ile kesilen normal bağlantılar flow'da SYN/PSH da taşır; sahte
+      # RST seli yalnızca RST veya RST+ACK'tir.
+      tcp_flags: { all: [rst], none: [syn, psh] }
     thresholds: { pps: 20k, bps: 100Mbps }
     baseline: { enabled: true, factor: 8, min_pps: 5k }
     conditions: { min_unique_sources: 20 }
@@ -127,7 +131,10 @@ rules:
     severity: medium
     match:
       protocols: [tcp]
-      tcp_flags: { all: [fin], any: [syn, urg] }
+      # Flow kayıtlarında bayraklar bağlantı boyunca birleşir (OR): normal bir
+      # bağlantı SYN|ACK|PSH|FIN görünür. Gerçek XMAS/SYN-FIN paketi el
+      # sıkışmaz, ACK taşımaz.
+      tcp_flags: { all: [fin], any: [syn, urg], none: [ack] }
     thresholds: { pps: 2k, bps: 10Mbps }
     trigger: { sustain: 3s, hold_down: 60s }
     mitigation: { action: flowspec-discard }

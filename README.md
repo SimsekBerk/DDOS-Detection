@@ -27,6 +27,7 @@ Router'lar ──NetFlow/IPFIX/sFlow──► collector ─► algılama motoru 
   - Prometheus `/metrics`, `/healthz`, `/readyz`, TLS, Docker ve systemd kurulumu → [docs/OPERATIONS.md](docs/OPERATIONS.md)
 - **Web arayüzü** (Türkçe, koyu/açık tema, mobil uyumlu): genel bakış, saldırılar ve olay detayı (CSV ve Markdown rapor), mitigasyon onayları, AI analist, trafik gezgini ve hedef analizi, ayarlar.
 - **Simülatör ve benchmark:** 27 senaryo; gerçek NetFlow/IPFIX/sFlow paketleri üretir, ağınızda saldırı trafiği üretmez. `ddos-bench` ile doğruluk, algılama süresi, yanlış alarm ve kapasite ölçümü.
+- **Paket sensörü (`ddos-probe`, macOS):** router export'u olmayan yerlerde bir makinenin trafiğini pasif dinleyip IPFIX flow olarak ddosd'ye gönderir; gerçek trafikle preprod testi için ([docs/TESTING.md](docs/TESTING.md) §1b).
 
 ## Hızlı başlangıç
 
@@ -75,6 +76,7 @@ Gereksinimler: Go 1.24 veya üzeri. UI'ı yeniden derlemek için Node 20 gerekir
 cmd/ddosd           daemon: collector + motor + mitigasyon + analist + bildirim + API/UI
 cmd/ddos-sim        komut satırı trafik/saldırı simülatörü
 cmd/ddos-bench      doğruluk, algılama süresi, yanlış alarm ve kapasite ölçümü
+cmd/ddos-probe      pasif paket sensörü: arayüz trafiğini IPFIX flow'a çevirir
 internal/decoder    NetFlow v5/v9, IPFIX, sFlow v5 çözücüler
 internal/collector  UDP dinleyiciler, worker havuzu, izin listesi, flow yönlendirme, exporter sağlığı
 internal/engine     seriler, baseline, kurallar, korelasyon, olaylar, sinyaller, kanıt
@@ -88,6 +90,7 @@ internal/audit      denetim kaydı
 internal/app        bileşenleri bağlar; yapılandırmayı doğrular, canlı uygular, sürümler
 internal/api        REST API, metrikler, gömülü UI
 internal/bench      benchmark düzeneği
+internal/probe      paket yakalama (BPF), flow önbelleği, IPFIX export
 internal/sim        sentetik trafik ve senaryolar (encoder'lar dahil)
 rules/              YAML kural setleri ve profiller
 web/                React + TypeScript arayüz (web/dist derlenmiş)

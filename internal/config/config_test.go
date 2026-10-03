@@ -6,7 +6,7 @@ import (
 )
 
 func TestExampleConfigsParse(t *testing.T) {
-	for _, f := range []string{"../../config.example.yaml", "../../config.demo.yaml"} {
+	for _, f := range []string{"../../config.example.yaml", "../../config.demo.yaml", "../../config.preprod.example.yaml"} {
 		if _, err := Load(f); err != nil {
 			t.Errorf("%s: %v", f, err)
 		}

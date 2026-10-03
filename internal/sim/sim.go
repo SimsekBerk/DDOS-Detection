@@ -397,23 +397,44 @@ func (s *Simulator) baselineSpecs(now time.Time) []Spec {
 		share   float64
 		size    uint16
 		proto   uint8
-		flags   uint8
+		flags   func() uint8
 		sport   func() uint16
 		dport   func() uint16
 		inbound bool
 	}
 	eph := func() uint16 { return uint16(32768 + rand.IntN(28000)) }
 	fixed := func(p uint16) func() uint16 { return func() uint16 { return p } }
+	none := func() uint8 { return 0 }
+	// Flow records carry the OR of all TCP flags seen in the flow, as router
+	// exports do: a complete short connection is SYN|ACK|PSH|FIN, the first
+	// export of a long one SYN|ACK|PSH, later exports ACK|PSH, aborted ones
+	// carry RST, ECN-capable ones ECE/CWR.
+	tcpFlags := func() uint8 {
+		const syn, ack, psh, fin, rst = flow.TCPSyn, flow.TCPAck, flow.TCPPsh, flow.TCPFin, flow.TCPRst
+		switch r := rand.Float64(); {
+		case r < 0.40:
+			return syn | ack | psh | fin
+		case r < 0.55:
+			return syn | ack | psh
+		case r < 0.85:
+			return ack | psh
+		case r < 0.93:
+			return syn | ack | psh | fin | flow.TCPEce | flow.TCPCwr
+		default:
+			return syn | ack | psh | rst
+		}
+	}
+	handshake := func() uint8 { return flow.TCPSyn | flow.TCPAck | flow.TCPFin } // health checks, port probes that complete
 	mixes := []mix{
-		{0.45, 1200, flow.ProtoTCP, flow.TCPAck | flow.TCPPsh, eph, fixed(443), true},  // client uploads/requests
-		{0.25, 1400, flow.ProtoTCP, flow.TCPAck | flow.TCPPsh, fixed(443), eph, false}, // server responses
-		{0.10, 1200, flow.ProtoUDP, 0, eph, fixed(443), true},                          // QUIC
-		{0.05, 80, flow.ProtoUDP, 0, eph, fixed(53), true},                             // DNS queries to our servers
-		{0.04, 300, flow.ProtoUDP, 0, fixed(53), eph, true},                            // DNS responses to our clients
-		{0.03, 90, flow.ProtoUDP, 0, fixed(123), fixed(123), true},                     // NTP
-		{0.03, 64, flow.ProtoTCP, flow.TCPSyn, eph, fixed(443), true},                  // new connections
-		{0.03, 84, flow.ProtoICMP, 0, nil, nil, true},                                  // pings
-		{0.02, 600, flow.ProtoTCP, flow.TCPAck | flow.TCPPsh, eph, fixed(22), true},    // ssh
+		{0.45, 1200, flow.ProtoTCP, tcpFlags, eph, fixed(443), true},  // client uploads/requests
+		{0.25, 1400, flow.ProtoTCP, tcpFlags, fixed(443), eph, false}, // server responses
+		{0.10, 1200, flow.ProtoUDP, none, eph, fixed(443), true},      // QUIC
+		{0.05, 80, flow.ProtoUDP, none, eph, fixed(53), true},         // DNS queries to our servers
+		{0.04, 300, flow.ProtoUDP, none, fixed(53), eph, true},        // DNS responses to our clients
+		{0.03, 90, flow.ProtoUDP, none, fixed(123), fixed(123), true}, // NTP
+		{0.03, 64, flow.ProtoTCP, handshake, eph, fixed(443), true},   // short connections without data
+		{0.03, 84, flow.ProtoICMP, none, nil, nil, true},              // pings
+		{0.02, 600, flow.ProtoTCP, tcpFlags, eph, fixed(22), true},    // ssh
 	}
 	for _, m := range mixes {
 		pps := bps * m.share / 8 / float64(m.size)
@@ -424,7 +445,7 @@ func (s *Simulator) baselineSpecs(now time.Time) []Spec {
 			if srv.Is6() {
 				cli = s.randomExternalV6()
 			}
-			sp := Spec{Proto: m.proto, TCPFlags: m.flags, PktSize: m.size, Packets: uint64(pps / float64(n) * (0.5 + rand.Float64()))}
+			sp := Spec{Proto: m.proto, TCPFlags: m.flags(), PktSize: m.size, Packets: uint64(pps / float64(n) * (0.5 + rand.Float64()))}
 			if m.sport != nil {
 				sp.SrcPort, sp.DstPort = m.sport(), m.dport()
 			}

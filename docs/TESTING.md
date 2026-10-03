@@ -28,6 +28,23 @@ go run ./cmd/ddosd -config config.demo.yaml
 
 Farklı telemetri formatlarını denemek için `config.demo.yaml` → `demo.encoder: sflow` ve `sampling_rate: 1000` yapın.
 
+## 1b. Gerçek trafikle preprod (bu makine)
+
+Demo sentetik trafikle çalışır. Gerçek trafiği görmek için ürünün pasif paket sensörü `ddos-probe`, bu makinenin ağ arayüzünü dinler. Paketleri bir router'ın flow önbelleği gibi flow'lara toplar ve IPFIX olarak ddosd'ye gönderir. Böylece decoder, motor ve arayüz gerçek veriyle çalışır.
+
+```bash
+cp config.preprod.example.yaml config.preprod.yaml   # alt ağı ve ağ geçidini girin (route -n get default; ifconfig en0)
+make build
+./bin/ddosd -config config.preprod.yaml              # http://127.0.0.1:8092, parola: data-preprod/initial-admin-password.txt
+./bin/ddos-probe -i en0 -collector 127.0.0.1:9995    # ayrı bir terminalde
+```
+
+- **İzin:** Probe macOS'ta `/dev/bpf*` okuma yetkisi ister. Wireshark kuruluysa kullanıcı `access_bpf` grubundadır ve sudo gerekmez; değilse `sudo` ile çalıştırın. Linux'ta softflowd/pmacct veya router export kullanın.
+- **Ne görür:** Switch'li ve Wi-Fi ağlarda bir makine yalnızca kendi trafiğini ve broadcast/multicast'i görür; diğer cihazların trafiğini görmez. Probe varsayılan olarak promiscuous modda çalışmaz. `-promisc` seçeneğini yalnızca izlemeye yetkili olduğunuz bir mirror (SPAN) portunda kullanın.
+- **Tüm ağı görmek için:** Ağ geçidinin, firewall'un veya core switch'in NetFlow/IPFIX/sFlow export'unu bu makineye, UDP 9995'e yönlendirin (ağ yöneticisi yetkisi gerekir). Ağ geçidinin adresini `collector.allow` listesine ekleyin.
+- **Doğruluk kontrolü:** Ağ geçidine sayısı bilinen ping gönderin, ör. `ping -c 200 -i 0.1 -s 1000 <ağ-geçidi>`. Trafik gezgininde hedef = ağ geçidi, protokol = icmp filtresiyle tam 200 paket ve 205.600 bayt görünmelidir. Arayüz sayaçlarıyla (`netstat -ibn -I en0`) toplam karşılaştırmada fark, Ethernet başlıkları ve flow export zamanlaması kadardır (%3–10).
+- Preprod yapılandırması mitigasyonu `manual` + `dryrun` tutar: öneriler oluşur, hiçbir kural router'a gönderilmez.
+
 ## 2. Simülatörle uzak test
 
 ddosd'yi gerçek sunucunuza kurun (Docker veya binary), ardından başka bir makineden simülatörü çalıştırın:
