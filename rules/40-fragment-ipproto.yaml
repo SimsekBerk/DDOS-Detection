@@ -49,6 +49,7 @@ rules:
     direction: inbound
     scope: host
     severity: medium
+    generic: true
     match: { fragment: true }
     thresholds: { pps: 40k, bps: 400Mbps }
     trigger: { sustain: 5s, hold_down: 60s }

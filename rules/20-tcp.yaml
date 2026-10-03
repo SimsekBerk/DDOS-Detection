@@ -151,15 +151,17 @@ rules:
   - id: tcp_conn_flood
     name: TCP Bağlantı Seli (yeni flow oranı)
     category: tcp_flood
-    description: Saniyedeki yeni TCP flow sayısında patlama; tamamlanmış el sıkışmalarıyla durum tablosu tüketimi. FPS yalnızca NetFlow/IPFIX'te anlamlıdır.
+    description: Saniyedeki tamamlanmış TCP bağlantısı (SYN+ACK ve veri/FIN içeren flow) sayısında patlama; durum tablosu ve uygulama kaynaklarını tüketir. FPS yalnızca NetFlow/IPFIX'te anlamlıdır (sFlow'da flow sayılmaz).
     direction: inbound
     scope: host
     severity: medium
-    match: { protocols: [tcp] }
+    match:
+      protocols: [tcp]
+      tcp_flags: { all: [syn, ack], any: [psh, fin] }
     thresholds: { fps: 30k }
-    baseline: { enabled: true, factor: 8, min_pps: 20k }
     trigger: { sustain: 10s, hold_down: 60s }
     mitigation: { action: scrub, note: Bağlantı sınırlama/rate-limit için scrubbing veya yük dengeleyici. }
+    rationale: Sahte kaynaklı SYN flood'lar el sıkışmayı tamamlamaz (yalnızca SYN); bu kural gerçek bağlantı açan botnet saldırılarını ayırır.
 
   - id: tcp_flood_generic
     name: TCP Hacimsel Flood (genel)
@@ -168,6 +170,7 @@ rules:
     direction: inbound
     scope: host
     severity: medium
+    generic: true
     match: { protocols: [tcp] }
     thresholds: { pps: 1M, bps: 5Gbps }
     baseline: { enabled: true, factor: 5, min_pps: 100k, min_bps: 1Gbps }

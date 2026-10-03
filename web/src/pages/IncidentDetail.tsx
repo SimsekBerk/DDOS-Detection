@@ -1,100 +1,77 @@
 import { useState } from "react";
-import { api, Finding, Incident, Mitigation } from "../api";
-import { StackedArea } from "../components/charts";
+import { api, Finding, Incident, Mitigation, SampleFlow } from "../api";
+import { useMe } from "../auth";
+import { TimeArea } from "../components/charts";
 import MitigationCard from "../components/MitigationCard";
-import { Bars, Card, Empty, ErrorLine, KV, Sev, Stat, Status, Tabs, Tag } from "../components/ui";
+import { Bars, Card, Empty, ErrorLine, Kpi, PageHead, Seg, Sev, Status, Tabs } from "../components/ui";
 import { actionLabel, bps, categoryLabel, classLabel, clock, dateTime, duration, go, num, pct, pps, run, usePoll } from "../lib";
 
-type Detail = { incident: Incident; mitigations: Mitigation[] | null; findings: Finding[] | null };
-
-const evTabs = [
-  { id: "top_sources", label: "Kaynak IP" },
-  { id: "top_src_ports", label: "Kaynak port" },
-  { id: "top_dst_ports", label: "Hedef port" },
-  { id: "top_src_nets", label: "Kaynak ağ" },
-  { id: "protocols", label: "Protokol" },
-  { id: "packet_sizes", label: "Paket boyu" },
-  { id: "tcp_flags", label: "TCP flag" },
-  { id: "exporters", label: "Exporter" },
-  { id: "samples", label: "Örnek flow" },
-] as const;
-type EvTab = (typeof evTabs)[number]["id"];
+type Detail = { incident: Incident; mitigations: Mitigation[]; findings: Finding[] };
+type EvTab = "sources" | "ports" | "proto" | "samples";
 
 export default function IncidentDetail({ id }: { id: string }) {
-  const d = usePoll(() => api.get<Detail>("/incidents/" + id), 2000, [id]);
-  const [ev, setEv] = useState<EvTab>("top_sources");
+  const me = useMe();
+  const d = usePoll(() => api.get<Detail>("/incidents/" + id), 2500, [id]);
+  const [unit, setUnit] = useState<"bps" | "pps">("bps");
+  const [ev, setEv] = useState<EvTab>("sources");
   const inc = d.data?.incident;
   if (!inc) return <div className="page">{d.error ? <ErrorLine error={d.error} /> : <Empty>Yükleniyor…</Empty>}</div>;
 
   const bd = inc.evidence?.breakdown;
   const dur = (inc.ended_at || Date.now() / 1000) - inc.started_at;
-  const series = (inc.series ?? []) as unknown as Record<string, number>[];
-  const requestReport = async () => {
-    const r = await run("AI olay raporu başlatıldı", () => api.post<{ finding_id: string }>(`/analyst/incident/${inc.id}`));
+  const report = async () => {
+    const r = await run("AI olay raporu hazırlanıyor", () => api.post<{ finding_id: string }>(`/analyst/incident/${inc.id}`));
     if (r) window.setTimeout(() => go("/analyst/" + r.finding_id), 1500);
   };
 
   return (
     <div className="page">
-      <div className="page-h">
-        <div>
-          <a href="#/incidents" className="small">
-            ← Saldırılar
-          </a>
-          <h1>
-            <Sev s={inc.severity} /> <span className="mono">{inc.target}</span>
-          </h1>
-          <div className="muted">
-            {inc.id} · {inc.object_name} ({inc.profile}) · {inc.scope === "prefix" ? "prefix / carpet bombing" : inc.scope} · {inc.direction}
-            {inc.reopened ? ` · ${inc.reopened} kez yeniden açıldı` : ""}
-          </div>
-        </div>
-        <div className="row">
-          <Status s={inc.status} />
-          <button className="btn" onClick={() => go("/explorer?dst=" + inc.target)}>
-            Flow Explorer
-          </button>
-          <button className="btn primary" onClick={requestReport}>
-            ✦ AI olay raporu
-          </button>
-        </div>
-      </div>
+      <PageHead
+        crumb={<a href="#/incidents">Saldırılar</a>}
+        title={
+          <span className="row">
+            <span className="mono wrap">{inc.target}</span>
+            <Status s={inc.status} />
+          </span>
+        }
+        desc={`${inc.object_name} · ${inc.scope === "prefix" ? "blok (carpet bombing)" : inc.scope === "object" ? "nesnenin tamamı" : "tek hedef"} · ${inc.direction === "outbound" ? "giden" : "gelen"} · ${inc.id}`}
+        actions={
+          <>
+            <a className="btn" href={`/api/v1/incidents/${inc.id}/report.md`}>
+              Rapor indir
+            </a>
+            {me.can_operate && !me.objects.length && (
+              <button className="btn primary" onClick={report}>
+                AI raporu
+              </button>
+            )}
+          </>
+        }
+      />
       <ErrorLine error={d.error} />
-
-      <div className="stats">
-        <Stat label="Tepe bps" value={bps(inc.peak_bps)} sub={inc.link_capacity_bps ? "bağlantının " + pct(inc.peak_bps / inc.link_capacity_bps) + "'i" : undefined} />
-        <Stat label="Tepe pps" value={pps(inc.peak_pps)} />
-        <Stat label="Şu an" value={bps(inc.cur_bps)} sub={pps(inc.cur_pps)} />
-        <Stat label="Süre" value={duration(dur)} sub={`${dateTime(inc.started_at)} – ${inc.ended_at ? clock(inc.ended_at) : "devam"}`} />
-        <Stat label="Benzersiz kaynak" value={num(bd?.unique_src)} sub={bd ? `ort. paket ${num(bd.avg_packet_size)} B` : "kanıt bekleniyor"} />
-        <Stat label="Fragment payı" value={bd ? pct(bd.fragment_share) : "-"} sub={bd ? `${num(bd.records)} kayıt` : ""} />
+      <div className="kpis">
+        <Kpi label="Önem" value={<Sev s={inc.severity} />} sub={`${inc.vectors.length} vektör`} />
+        <Kpi label="Tepe" value={bps(inc.peak_bps)} sub={pps(inc.peak_pps) + (inc.link_capacity_bps ? ` · bağlantının ${pct(inc.peak_bps / inc.link_capacity_bps)}'i` : "")} />
+        <Kpi label="Şu an" value={bps(inc.cur_bps)} sub={pps(inc.cur_pps)} />
+        <Kpi label="Süre" value={duration(dur)} sub={`${dateTime(inc.started_at)}${inc.ended_at ? " – " + clock(inc.ended_at) : ""}`} />
       </div>
 
-      <div className="grid g-2">
-        <Card title="Saldırı trafiği (aktif vektörlerin en yükseği)">
-          {series.length ? (
-            <StackedArea data={series} series={[{ key: "bps", name: "bps", color: "var(--red)" }]} unit="bps" height={220} />
-          ) : (
-            <Empty>Seri yok</Empty>
-          )}
-        </Card>
-        <Card title="pps">
-          {series.length ? <StackedArea data={series} series={[{ key: "pps", name: "pps", color: "var(--amber)" }]} unit="pps" height={220} /> : <Empty>Seri yok</Empty>}
-        </Card>
-      </div>
+      <Card title="Saldırı trafiği" actions={<Seg value={unit} onChange={setUnit} options={[{ id: "bps", label: "bit/sn" }, { id: "pps", label: "paket/sn" }]} />}>
+        {(inc.series ?? []).length ? (
+          <TimeArea data={(inc.series ?? []) as unknown as Record<string, number>[]} series={[{ key: unit, name: unit === "bps" ? "bit/sn" : "paket/sn", color: "var(--series-1)" }]} unit={unit} height={220} />
+        ) : (
+          <Empty>Seri yok</Empty>
+        )}
+      </Card>
 
-      <Card title={`Vektörler (${inc.vectors.length})`} pad={false}>
+      <Card title="Vektörler" flush>
         <div className="tbl-wrap">
           <table className="tbl">
             <thead>
               <tr>
                 <th>Kural</th>
-                <th>Kategori</th>
-                <th>Tetik nedeni</th>
-                <th className="r">Eşik</th>
-                <th className="r">Şu an</th>
-                <th className="r">Tepe</th>
-                <th className="r">Ort. paket</th>
+                <th>Neden tetiklendi</th>
+                <th className="num">Tepe</th>
                 <th>Önerilen aksiyon</th>
                 <th>Durum</th>
               </tr>
@@ -102,39 +79,21 @@ export default function IncidentDetail({ id }: { id: string }) {
             <tbody>
               {inc.vectors.map((v) => (
                 <tr key={v.rule_id}>
-                  <td>
-                    <a href={"#/rules?id=" + v.rule_id}>
-                      <b>{v.rule_name}</b>
-                    </a>
-                    <div className="small muted mono">{v.rule_id}</div>
+                  <td style={{ maxWidth: 240 }}>
+                    <div className="cell-main">{v.rule_name}</div>
+                    <div className="cell-sub">{categoryLabel[v.category] ?? v.category}</div>
                   </td>
-                  <td>
-                    <Tag>{categoryLabel[v.category] ?? v.category}</Tag>
+                  <td style={{ maxWidth: 320 }}>
+                    <div className="small wrap">{v.reason}</div>
+                    <div className="cell-sub">ort. paket {num(v.avg_packet_size)} B{v.unique_sources ? ` · ${num(v.unique_sources)} kaynak` : ""}</div>
                   </td>
-                  <td className="small">
-                    {v.reason}
-                    <div className="muted">{v.trigger_kind === "baseline" ? `baseline ${pps(v.baseline_pps)} / ${bps(v.baseline_bps)}` : "statik eşik"}</div>
-                  </td>
-                  <td className="r mono small">
-                    {v.threshold_pps ? pps(v.threshold_pps) : "-"}
-                    <br />
-                    {v.threshold_bps ? bps(v.threshold_bps) : ""}
-                  </td>
-                  <td className="r mono small">
-                    {pps(v.cur_pps)}
-                    <br />
-                    {bps(v.cur_bps)}
-                  </td>
-                  <td className="r mono small">
-                    {pps(v.peak_pps)}
-                    <br />
+                  <td className="num">
                     {bps(v.peak_bps)}
+                    <div className="cell-sub">{pps(v.peak_pps)}</div>
                   </td>
-                  <td className="r mono small">{num(v.avg_packet_size)} B</td>
                   <td className="small">{actionLabel[v.mitigation_action] ?? v.mitigation_action}</td>
                   <td>
                     <Status s={v.active ? "active" : "ended"} />
-                    <div className="small muted">{clock(v.started_at)}</div>
                   </td>
                 </tr>
               ))}
@@ -143,39 +102,81 @@ export default function IncidentDetail({ id }: { id: string }) {
         </div>
       </Card>
 
-      <div className="grid g-3-1">
-        <Card title="Kanıt (adli kırılım)" actions={<span className="small muted">son {bd?.seconds ?? 30} sn · güncelleme {clock(inc.evidence?.computed_at)}</span>}>
-          <Tabs value={ev} onChange={setEv} tabs={evTabs.map((t) => ({ id: t.id, label: t.label }))} />
-          {!bd ? (
-            <Empty>Kanıt hesaplanıyor…</Empty>
-          ) : ev === "samples" ? (
-            <SampleTable samples={inc.evidence?.samples ?? []} />
-          ) : (
-            <Bars rows={bd[ev]} metric={ev === "packet_sizes" || ev === "tcp_flags" ? "pps" : "bps"} />
-          )}
-        </Card>
-        <Card title="Özet">
-          <KV
-            items={[
-              ["Toplam (kanıt penceresi)", bd ? `${bps(bd.total_bps)} · ${pps(bd.total_pps)}` : "-"],
-              ["Benzersiz hedef", num(bd?.unique_dst)],
-              ["Örnekleme", bd?.sampling_rates?.map((r) => "1:" + r).join(", ") ?? "-"],
-              ["Bağlantı kapasitesi", inc.link_capacity_bps ? bps(inc.link_capacity_bps) : "tanımsız"],
-              ["AI bulguları", (d.data?.findings ?? []).length],
+      <div className="grid cols-main">
+        <Card title="Kanıt" flush actions={bd ? <span className="small muted">son {bd.seconds} sn · {num(bd.unique_src)} kaynak · fragment {pct(bd.fragment_share)}</span> : null}>
+          <Tabs
+            value={ev}
+            onChange={setEv}
+            tabs={[
+              { id: "sources", label: "Kaynaklar" },
+              { id: "ports", label: "Portlar" },
+              { id: "proto", label: "Protokol ve boyut" },
+              { id: "samples", label: "Örnek kayıtlar" },
             ]}
           />
-          {(d.data?.findings ?? []).map((f) => (
-            <div key={f.id} className="mini-finding clickable" onClick={() => go("/analyst/" + f.id)}>
-              <Sev s={f.severity || "info"} /> <span className="small">{classLabel[f.classification] ?? f.classification}</span>
-              <div className="small">{f.title}</div>
-            </div>
-          ))}
+          <div className="card-body">
+            {!bd ? (
+              <Empty>Kanıt hesaplanıyor…</Empty>
+            ) : ev === "sources" ? (
+              <div className="grid cols-2">
+                <div>
+                  <h3>Kaynak IP</h3>
+                  <Bars rows={bd.top_sources} />
+                </div>
+                <div>
+                  <h3>Kaynak ağ</h3>
+                  <Bars rows={bd.top_src_nets} />
+                </div>
+              </div>
+            ) : ev === "ports" ? (
+              <div className="grid cols-2">
+                <div>
+                  <h3>Kaynak port</h3>
+                  <Bars rows={bd.top_src_ports} />
+                </div>
+                <div>
+                  <h3>Hedef port</h3>
+                  <Bars rows={bd.top_dst_ports} />
+                </div>
+              </div>
+            ) : ev === "proto" ? (
+              <div className="grid cols-2">
+                <div>
+                  <h3>Protokol</h3>
+                  <Bars rows={bd.protocols} />
+                </div>
+                <div>
+                  <h3>Paket boyu</h3>
+                  <Bars rows={bd.packet_sizes} metric="pps" />
+                </div>
+              </div>
+            ) : (
+              <SampleTable samples={inc.evidence?.samples ?? []} />
+            )}
+          </div>
+        </Card>
+        <Card title="AI bulguları">
+          {(d.data?.findings ?? []).length === 0 ? (
+            <Empty>Bu olay için henüz analiz yok</Empty>
+          ) : (
+            (d.data?.findings ?? []).map((f) => (
+              <div key={f.id} className="item" style={{ cursor: "pointer" }} onClick={() => go("/analyst/" + f.id)}>
+                <div className="row">
+                  <Sev s={f.severity || "info"} />
+                  <span className="small muted">{classLabel[f.classification] ?? f.classification}</span>
+                </div>
+                <div className="small" style={{ marginTop: 4 }}>
+                  {f.title}
+                </div>
+              </div>
+            ))
+          )}
         </Card>
       </div>
 
-      <Card title={`Mitigasyonlar (${(d.data?.mitigations ?? []).length})`}>
+      <Card title="Mitigasyonlar">
         {(d.data?.mitigations ?? []).length === 0 ? (
-          <Empty>Bu olay için mitigasyon talebi yok (kural aksiyonu "alarm" veya mod kapalı olabilir).</Empty>
+          <Empty>Bu olay için mitigasyon talebi yok</Empty>
         ) : (
           (d.data?.mitigations ?? []).map((m) => <MitigationCard key={m.id} m={m} onChange={d.reload} />)
         )}
@@ -184,7 +185,7 @@ export default function IncidentDetail({ id }: { id: string }) {
   );
 }
 
-export function SampleTable({ samples }: { samples: { time: number; src: string; dst: string; src_port: number; dst_port: number; protocol: string; tcp_flags?: string; icmp?: string; fragment?: boolean; packets: number; bytes: number; avg_packet_size: number; sampling_rate: number; exporter: string; source: string }[] }) {
+export function SampleTable({ samples }: { samples: SampleFlow[] }) {
   if (samples.length === 0) return <Empty>Örnek yok</Empty>;
   return (
     <div className="tbl-wrap">
@@ -194,12 +195,9 @@ export function SampleTable({ samples }: { samples: { time: number; src: string;
             <th>Zaman</th>
             <th>Kaynak</th>
             <th>Hedef</th>
-            <th>Proto</th>
-            <th>Flag/ICMP</th>
-            <th className="r">Paket</th>
-            <th className="r">Byte</th>
-            <th className="r">Ort.</th>
-            <th>Örnekleme</th>
+            <th>Protokol</th>
+            <th className="num">Paket</th>
+            <th className="num">Ort. boyut</th>
             <th>Exporter</th>
           </tr>
         </thead>
@@ -217,15 +215,14 @@ export function SampleTable({ samples }: { samples: { time: number; src: string;
               </td>
               <td>
                 {s.protocol}
-                {s.fragment ? <Tag>frag</Tag> : null}
+                {s.tcp_flags ? " " + s.tcp_flags : ""}
+                {s.icmp ? " " + s.icmp : ""}
+                {s.fragment ? " (fragment)" : ""}
               </td>
-              <td className="mono">{s.tcp_flags ?? s.icmp ?? ""}</td>
-              <td className="r mono">{num(s.packets)}</td>
-              <td className="r mono">{num(s.bytes)}</td>
-              <td className="r mono">{num(s.avg_packet_size)}</td>
-              <td className="mono">1:{s.sampling_rate}</td>
+              <td className="num">{num(s.packets)}</td>
+              <td className="num">{num(s.avg_packet_size)} B</td>
               <td className="mono">
-                {s.exporter} <span className="muted">{s.source}</span>
+                {s.exporter} <span className="muted">1:{s.sampling_rate}</span>
               </td>
             </tr>
           ))}

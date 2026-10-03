@@ -9,6 +9,7 @@ web/node_modules/
 
 # local configuration (copy from config.example.yaml)
 /config.yaml
+/config/
 
 # editors / OS
 .DS_Store

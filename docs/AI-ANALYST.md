@@ -6,7 +6,7 @@ AI analist, algılama motorunun **"ikinci görüş"** katmanıdır. Kıdemli bir
 - "Dedektör neden kaçırdı?" sorusunu cevaplar.
 - Raporlar ve öneri üretir.
 
-Analist **hızlı yolda değildir**: algılama ve mitigasyon kararları deterministik motorda verilir. Analistin hiçbir yazma yetkisi yoktur; tek yan etkisi bulgu kaydetmektir. Öneriler UI'da insan onayıyla uygulanır.
+Analist **hızlı yolda değildir**: algılama ve mitigasyon kararları deterministik motorda verilir. Analistin hiçbir yazma yetkisi yoktur; tek yan etkisi bulgu kaydetmektir. Öneriler UI'da insan onayıyla uygulanır: FlowSpec/RTBH/scrubbing önerilerini onay kuyruğuna göndermek operatör, eşik değişikliği önerisini uygulamak yönetici yetkisi ister; nesne kapsamlı (müşteri) kullanıcılar analizi çalıştıramaz.
 
 ## Akış
 

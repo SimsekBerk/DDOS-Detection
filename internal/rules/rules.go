@@ -17,14 +17,18 @@ import (
 )
 
 type Rule struct {
-	ID             string     `yaml:"id" json:"id"`
-	Name           string     `yaml:"name" json:"name"`
-	Description    string     `yaml:"description" json:"description"`
-	Category       string     `yaml:"category" json:"category"`
-	Direction      string     `yaml:"direction" json:"direction"` // inbound | outbound
-	Scope          string     `yaml:"scope" json:"scope"`         // host | prefix | object
-	Enabled        *bool      `yaml:"enabled" json:"-"`
-	Severity       string     `yaml:"severity" json:"severity"`
+	ID          string `yaml:"id" json:"id"`
+	Name        string `yaml:"name" json:"name"`
+	Description string `yaml:"description" json:"description"`
+	Category    string `yaml:"category" json:"category"`
+	Direction   string `yaml:"direction" json:"direction"` // inbound | outbound
+	Scope       string `yaml:"scope" json:"scope"`         // host | prefix | object
+	Enabled     *bool  `yaml:"enabled" json:"-"`
+	Severity    string `yaml:"severity" json:"severity"`
+	// Generic marks catch-all rules (e.g. "all UDP to a host"). A generic
+	// vector is suppressed while specific vectors on the same target already
+	// explain most of its traffic, so one attack is reported once.
+	Generic        bool       `yaml:"generic" json:"generic"`
 	Match          Match      `yaml:"match" json:"match"`
 	Thresholds     Thresholds `yaml:"thresholds" json:"thresholds"`
 	Baseline       Baseline   `yaml:"baseline" json:"baseline"`
@@ -128,12 +132,48 @@ type Override struct {
 	FPS     *config.Rate `json:"fps,omitempty"`
 }
 
+// MaxRules is the maximum number of rules (classification uses a 128-bit set).
+const MaxRules = 128
+
 // Set is an immutable, compiled rule set.
 type Set struct {
 	Rules    []*Compiled
 	Profiles map[string]*Profile
 	ByID     map[string]*Compiled
 	Files    []string
+
+	within   [][]bool // within[a][b]: every flow matching rule a also matches rule b
+	disjoint [][]bool // disjoint[a][b]: no flow can match both rules
+	breadth  []int    // number of rules contained in each rule (more = more general)
+}
+
+// Within reports whether every flow matched by rule a (index) is also
+// matched by rule b. The engine uses it for hierarchical correlation: an
+// active vector can only explain ("cover") traffic of a rule that contains
+// it, e.g. DNS amplification inside "all UDP", but never TCP SYN inside UDP.
+func (s *Set) Within(a, b int) bool {
+	if a < 0 || b < 0 || a >= len(s.within) || b >= len(s.within) {
+		return false
+	}
+	return s.within[a][b]
+}
+
+// Disjoint reports whether no flow can match both rules (by index). Rates of
+// disjoint vectors on one target can be added without double counting.
+func (s *Set) Disjoint(a, b int) bool {
+	if a < 0 || b < 0 || a >= len(s.disjoint) || b >= len(s.disjoint) {
+		return false
+	}
+	return s.disjoint[a][b]
+}
+
+// Breadth is the number of rules contained in rule i; general rules have a
+// larger breadth and are decided after narrower ones.
+func (s *Set) Breadth(i int) int {
+	if i < 0 || i >= len(s.breadth) {
+		return 0
+	}
+	return s.breadth[i]
 }
 
 // Load reads all *.yaml / *.yml files in dir (sorted) and compiles them.
@@ -201,7 +241,175 @@ func Load(dir string, overrides map[string]Override) (*Set, error) {
 	if len(s.Rules) == 0 {
 		return nil, fmt.Errorf("no rules found in %s", dir)
 	}
+	if len(s.Rules) > MaxRules {
+		return nil, fmt.Errorf("too many rules (%d > %d)", len(s.Rules), MaxRules)
+	}
+	n := len(s.Rules)
+	s.within, s.disjoint, s.breadth = make([][]bool, n), make([][]bool, n), make([]int, n)
+	for i, a := range s.Rules {
+		s.within[i], s.disjoint[i] = make([]bool, n), make([]bool, n)
+		for j, b := range s.Rules {
+			s.within[i][j] = a.within(b)
+			s.disjoint[i][j] = a.disjoint(b)
+		}
+	}
+	for i := range s.Rules {
+		for j := range s.Rules {
+			if s.within[j][i] {
+				s.breadth[i]++
+			}
+		}
+	}
 	return s, nil
+}
+
+// disjoint is a conservative test that no flow can match both rules: true
+// only when some constraint pair provably excludes each other.
+func (a *Compiled) disjoint(b *Compiled) bool {
+	if a.Direction != b.Direction {
+		return true
+	}
+	common := false
+	for p := 0; p < 256 && !common; p++ {
+		common = (a.anyProto || a.protos[p]) && !a.notProtos[p] && (b.anyProto || b.protos[p]) && !b.notProtos[p]
+	}
+	if !common {
+		return true
+	}
+	am, bm := &a.Match, &b.Match
+	// Port constraints never match fragments.
+	fragOnly := func(m *Match) bool { return m.Fragment != nil && *m.Fragment }
+	hasPorts := func(c *Compiled) bool { return len(c.srcPorts) > 0 || len(c.dstPorts) > 0 }
+	if am.Fragment != nil && bm.Fragment != nil && *am.Fragment != *bm.Fragment ||
+		fragOnly(am) && hasPorts(b) || fragOnly(bm) && hasPorts(a) {
+		return true
+	}
+	if am.IPVersion != 0 && bm.IPVersion != 0 && am.IPVersion != bm.IPVersion {
+		return true
+	}
+	if rangesDisjoint(a.srcPorts, b.srcPorts) || rangesDisjoint(a.dstPorts, b.dstPorts) {
+		return true
+	}
+	if a.tcpCheck && b.tcpCheck {
+		if a.flagsAll&b.flagsNone != 0 || b.flagsAll&a.flagsNone != 0 ||
+			a.flagsEmpty && (b.flagsAll != 0 || b.flagsAny != 0) || b.flagsEmpty && (a.flagsAll != 0 || a.flagsAny != 0) {
+			return true
+		}
+	}
+	if a.icmpTypes != nil && b.icmpTypes != nil {
+		shared := false
+		for k := range a.icmpTypes {
+			if b.icmpTypes[k] {
+				shared = true
+				break
+			}
+		}
+		if !shared {
+			return true
+		}
+	}
+	if am.MaxPacketSize > 0 && bm.MinPacketSize > am.MaxPacketSize || bm.MaxPacketSize > 0 && am.MinPacketSize > bm.MaxPacketSize {
+		return true
+	}
+	return false
+}
+
+// rangesDisjoint: both constrained and no range of a overlaps a range of b.
+func rangesDisjoint(a, b []portRange) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	for _, r := range a {
+		for _, q := range b {
+			if r.lo <= q.hi && q.lo <= r.hi {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// within is a conservative subset test of match conditions: true only when
+// every constraint of b is implied by a's constraints. Unknown or partially
+// overlapping cases return false, so a vector is never hidden by an
+// unrelated one (a duplicate report is preferred over a missed vector).
+func (a *Compiled) within(b *Compiled) bool {
+	if a.Direction != b.Direction {
+		return false
+	}
+	inA := func(p int) bool { return (a.anyProto || a.protos[p]) && !a.notProtos[p] }
+	inB := func(p int) bool { return (b.anyProto || b.protos[p]) && !b.notProtos[p] }
+	for p := 0; p < 256; p++ {
+		if inA(p) && !inB(p) {
+			return false
+		}
+	}
+	am, bm := &a.Match, &b.Match
+	if bm.IPVersion != 0 && am.IPVersion != bm.IPVersion {
+		return false
+	}
+	if bm.Fragment != nil && (am.Fragment == nil || *am.Fragment != *bm.Fragment) {
+		return false
+	}
+	if !portsWithin(a.srcPorts, b.srcPorts) || !portsWithin(a.dstPorts, b.dstPorts) {
+		return false
+	}
+	if b.tcpCheck {
+		if !a.tcpCheck || b.flagsAll&^a.flagsAll != 0 || b.flagsNone&^a.flagsNone != 0 || (b.flagsEmpty && !a.flagsEmpty) {
+			return false
+		}
+		if b.flagsAny != 0 && a.flagsAll&b.flagsAny == 0 && (a.flagsAny == 0 || a.flagsAny&^b.flagsAny != 0) {
+			return false
+		}
+	}
+	if !setWithin(a.icmpTypes, b.icmpTypes) || !setWithin(a.icmpCodes, b.icmpCodes) {
+		return false
+	}
+	if bm.MinPacketSize > 0 && am.MinPacketSize < bm.MinPacketSize {
+		return false
+	}
+	if bm.MaxPacketSize > 0 && (am.MaxPacketSize == 0 || am.MaxPacketSize > bm.MaxPacketSize) {
+		return false
+	}
+	return true
+}
+
+// portsWithin: b unconstrained, or every range of a lies inside some range of b.
+func portsWithin(a, b []portRange) bool {
+	if len(b) == 0 {
+		return true
+	}
+	if len(a) == 0 {
+		return false
+	}
+	for _, r := range a {
+		ok := false
+		for _, q := range b {
+			if r.lo >= q.lo && r.hi <= q.hi {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func setWithin(a, b map[uint8]bool) bool {
+	if b == nil {
+		return true
+	}
+	if a == nil {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 type portRange struct{ lo, hi uint16 }

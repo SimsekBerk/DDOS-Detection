@@ -9,8 +9,16 @@ collector:
   # yalnızca alışkanlık/ACL kolaylığı içindir.
   listen: [":2055", ":4739", ":6343"]
   read_buffer_bytes: 16777216     # Linux'ta net.core.rmem_max en az bu kadar olmalı
-  queue_size: 8192                # collector → engine batch kuyruğu
+  queue_size: 8192                # datagram kuyruğu (worker başına)
   default_sampling_rate: 1        # exporter örnekleme bildirmezse kullanılır
+  workers: 0                      # 0 = CPU sayısı (en fazla 16); aynı exporter hep aynı worker'a düşer
+  # Production'da yalnızca kendi router'larınızı kabul edin (boş = herkes).
+  allow:
+    # - 10.0.0.0/24
+  # Gelen datagram'ları başka collector'lara kopyala (mevcut sistemle paralel
+  # çalıştırma / geçiş dönemi için).
+  forward:
+    # - 10.0.0.50:2055
 
 # Exporter (router) bazlı ayarlar. Router örnekleme oranını flow içinde
 # göndermiyorsa (ör. bazı sFlow/NetFlow v5 kurulumları) buradan zorlayın.
@@ -59,8 +67,10 @@ engine:
   signal_min_z: 4           # baseline sapması için z-skoru
   signal_min_pps: 2000
   signal_min_bps: 20Mbps
+  signal_min_seconds: 20    # sapma en az bu kadar sürmeli (sinyal gürültüsü bastırma)
   incident_reopen: 2m       # olay bittikten sonra bu sürede tekrar tetiklenirse aynı olay açılır
   evidence_every: 10s
+  max_series: 200000        # izlenen (kural, hedef) serisi üst sınırı — bellek koruması
 
 # ---------------------------------------------------------------------------
 # Mitigasyon
@@ -104,12 +114,47 @@ analyst:
     api_key_env: ""
 
 # ---------------------------------------------------------------------------
+# Bildirimler — arayüzden (Ayarlar → Bildirimler) de eklenip test edilebilir
+# ---------------------------------------------------------------------------
+# type: slack | teams | telegram | email | syslog | webhook
+# events boş = incident.started, incident.ended, mitigation.pending, mitigation.failed
+notifications:
+  channels:
+    # - name: noc-slack
+    #   type: slack
+    #   enabled: true
+    #   min_severity: medium
+    #   url: https://hooks.slack.com/services/XXX/YYY/ZZZ
+    # - name: siem
+    #   type: syslog
+    #   enabled: true
+    #   min_severity: low
+    #   address: siem.example.net:514
+    #   protocol: tcp
+    #   events: [incident.started, incident.ended, vector.added, mitigation.active, mitigation.withdrawn]
+    # - name: soar
+    #   type: webhook
+    #   enabled: true
+    #   min_severity: high
+    #   url: https://soar.example.net/hooks/ddos
+    #   secret: "değiştirin"      # X-DDoS-Signature: sha256=HMAC(body)
+
+# ---------------------------------------------------------------------------
 # Web UI / API
 # ---------------------------------------------------------------------------
 api:
   listen: ":8080"
+  # HTTPS (veya önüne TLS sonlandıran bir reverse proxy koyun)
+  tls_cert: ""              # /etc/ddosd/tls.crt
+  tls_key: ""               # /etc/ddosd/tls.key
+  session_ttl: 12h
+  base_url: ""              # bildirimlerdeki bağlantılar için, ör. https://ddos.example.net
+  # İlk yönetici hesabı — yalnızca kullanıcı deposu boşken (ilk açılış) kullanılır.
+  # password boş bırakılırsa rastgele parola üretilir ve
+  # <data_dir>/initial-admin-password.txt dosyasına yazılır.
+  # Parola unutulursa:  ddosd -config config.yaml -reset-admin admin
   username: admin
-  password: ""              # ağa açıyorsanız MUTLAKA ayarlayın (basic auth)
+  password: ""
 
 # Demo simülatörü kapalı (gerçek ağ)
 demo:

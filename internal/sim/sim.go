@@ -101,14 +101,19 @@ type Simulator struct {
 	specs       uint64
 }
 
-// New creates a simulator that sends to collector (host:port).
+// New creates a simulator that sends to collector (host:port). An empty
+// collector creates an in-process generator (see Generate) without a socket.
 func New(encoder string, samplingRate uint32, collector string, protected []netip.Prefix, baselineBPS float64) (*Simulator, error) {
 	if len(protected) == 0 {
 		return nil, errors.New("sim: no protected prefixes")
 	}
-	conn, err := net.Dial("udp", collector)
-	if err != nil {
-		return nil, err
+	var conn net.Conn
+	if collector != "" {
+		c, err := net.Dial("udp", collector)
+		if err != nil {
+			return nil, err
+		}
+		conn = c
 	}
 	s := &Simulator{
 		enc: NewEncoder(encoder, samplingRate), rate: samplingRate, collector: collector, conn: conn,
@@ -182,6 +187,18 @@ func (s *Simulator) randomExternalV6() netip.Addr {
 	return netip.AddrFrom16(b)
 }
 
+// RelativePPS sizes a near-miss scenario from the target's effective
+// thresholds (packets/s and bits/s; zero = not set).
+func (sc Scenario) RelativePPS(tPPS, tBPS float64) float64 {
+	pps := tPPS
+	if tBPS > 0 && sc.PktSize > 0 {
+		if byBPS := tBPS / (sc.PktSize * 8); pps == 0 || byBPS < pps {
+			pps = byBPS
+		}
+	}
+	return pps * sc.RelativeFactor
+}
+
 // Lookup returns a scenario definition.
 func Lookup(id string) (Scenario, bool) {
 	sc, ok := catalogue[id]
@@ -206,8 +223,11 @@ func Scenarios() []Scenario {
 	return out
 }
 
-// Start launches a scenario.
-func (s *Simulator) Start(req StartRequest) (*Run, error) {
+// Start launches a scenario now.
+func (s *Simulator) Start(req StartRequest) (*Run, error) { return s.StartAt(req, time.Now()) }
+
+// StartAt launches a scenario at a given (possibly simulated) time.
+func (s *Simulator) StartAt(req StartRequest, at time.Time) (*Run, error) {
 	sc := catalogue[req.Scenario]
 	if sc == nil {
 		return nil, fmt.Errorf("unknown scenario %q", req.Scenario)
@@ -274,7 +294,7 @@ func (s *Simulator) Start(req StartRequest) (*Run, error) {
 			r.srcPool = append(r.srcPool, s.randomExternal())
 		}
 	}
-	now := time.Now().Unix()
+	now := at.Unix()
 	r.StartedAt, r.EndsAt = now, now+int64(dur)
 	s.mu.Lock()
 	s.seq++
@@ -309,6 +329,9 @@ func (s *Simulator) Status() Status {
 
 // Loop generates traffic every second until ctx is done.
 func (s *Simulator) Loop(ctx context.Context) {
+	if s.conn == nil {
+		return
+	}
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	defer s.conn.Close()
@@ -322,8 +345,12 @@ func (s *Simulator) Loop(ctx context.Context) {
 	}
 }
 
-func (s *Simulator) step(now time.Time) {
+// Generate returns one second of traffic (baseline + active runs) at now and
+// expires finished runs. It is used by the UDP loop and by in-process
+// replay/benchmark harnesses.
+func (s *Simulator) Generate(now time.Time) []Spec {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	var specs []Spec
 	if s.baseline {
 		specs = append(specs, s.baselineSpecs(now)...)
@@ -337,7 +364,11 @@ func (s *Simulator) step(now time.Time) {
 		specs = append(specs, r.sc.gen(c)...)
 	}
 	s.specs += uint64(len(specs))
-	s.mu.Unlock()
+	return specs
+}
+
+func (s *Simulator) step(now time.Time) {
+	specs := s.Generate(now)
 
 	// Spread datagrams over the second to avoid micro-bursts on loopback.
 	dgs := s.enc.Encode(specs, now)

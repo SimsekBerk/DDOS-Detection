@@ -1,8 +1,9 @@
-# Kendi ağınızda çalıştırmak için:
-#   cp config.example.yaml config.yaml   (prefixleri düzenleyin)
+# Kendi ağınızda çalıştırmak için (repo kökünde):
+#   mkdir -p config && cp config.example.yaml config/config.yaml   (prefixleri düzenleyin)
+#   sudo chown -R 10001 config      # konteyner kullanıcısı; arayüzden kaydetme için yazılabilir olmalı
 #   docker compose -f deploy/docker-compose.yml up -d
-# Sadece demo için:
-#   DDOSD_CONFIG=config.demo.yaml docker compose -f deploy/docker-compose.yml up
+# Sadece demo için (yapılandırma imaj içinde, salt okunur):
+#   DDOSD_CONFIG=/app/config.demo.yaml docker compose -f deploy/docker-compose.yml up
 #
 # ExaBGP ile FlowSpec/RTBH duyurmak için "bgp" profilini açın:
 #   docker compose -f deploy/docker-compose.yml --profile bgp up -d
@@ -13,7 +14,7 @@ services:
     build: ..
     image: ddosd:local
     restart: unless-stopped
-    command: ["-config", "/app/${DDOSD_CONFIG:-config.yaml}"]
+    command: ["-config", "${DDOSD_CONFIG:-/etc/ddosd/config.yaml}"]
     ports:
       - "2055:2055/udp"   # NetFlow v5/v9 (+IPFIX/sFlow otomatik)
       - "4739:4739/udp"   # IPFIX
@@ -21,12 +22,17 @@ services:
       - "8080:8080"       # Web UI / API (config.demo.yaml 8090 kullanır)
       - "8090:8090"
     volumes:
-      - ../config.yaml:/app/config.yaml:ro
+      - ../config:/etc/ddosd          # config.yaml; arayüzden kaydedilen sürümler data dizinine yazılır
       - ../rules:/app/rules:ro
       - ddosd-data:/data
       - exabgp-cmd:/var/run/ddosd
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    healthcheck:              # api.listen portu; demo için DDOSD_HTTP_PORT=8090
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${DDOSD_HTTP_PORT:-8080}/readyz || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
 
   exabgp:
     profiles: ["bgp"]

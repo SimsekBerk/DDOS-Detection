@@ -219,6 +219,7 @@ rules:
     direction: inbound
     scope: host
     severity: medium
+    generic: true
     match:
       protocols: [udp]
       src_ports: ["1-1023"]

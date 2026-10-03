@@ -441,3 +441,22 @@ func (s *Incidents) restore(d incidentsDump, now int64) {
 		s.byID[i.ID] = i
 	}
 }
+
+// remapObjects updates object ids after the object list changed.
+func (s *Incidents) remapObjects(idMap map[int32]int32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, inc := range s.byID {
+		if nid, ok := idMap[inc.ObjectID]; ok {
+			inc.ObjectID = nid
+		} else {
+			inc.ObjectID = -1
+		}
+	}
+}
+
+func (s *Incidents) setReopen(d time.Duration) {
+	s.mu.Lock()
+	s.reopen = int64(d.Seconds())
+	s.mu.Unlock()
+}

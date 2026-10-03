@@ -103,9 +103,13 @@ type Record struct {
 	InIf, OutIf  uint32
 	SrcAS, DstAS uint32
 
-	// Filled in by the engine during normalization.
+	// Filled in by classification (engine.Classify), possibly in parallel
+	// collector workers. ClassGen identifies the rule/object generation the
+	// classification was made with; 0 = not classified.
 	Direction Direction
-	ObjectID  int32 // index of protected object, -1 if none
+	ObjectID  int32     // index of protected object, -1 if none
+	Matched   [2]uint64 // bitset of matching rule indexes (max 128 rules)
+	ClassGen  uint32
 }
 
 // ScaledBytes returns estimated real bytes (sampling applied).

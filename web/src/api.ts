@@ -46,6 +46,8 @@ export interface EngineSnapshot {
   oldest_flow: number;
   rules: number;
   rules_active: number;
+  series_overflow: number;
+  max_series: number;
 }
 
 export interface AnalystStatus {
@@ -71,10 +73,11 @@ export interface Overview {
   engine: EngineSnapshot;
   mitigation: { pending: number; active: number; mode: string; driver: string };
   analyst: AnalystStatus;
-  exporters_total: number;
-  exporters_up: number;
-  listening: string[];
+  exporters_total?: number;
+  exporters_up?: number;
+  listening?: string[];
   demo: boolean;
+  restart_pending: string[];
 }
 
 export interface Vector {
@@ -313,6 +316,7 @@ export interface RuleView {
   scope: string;
   severity: string;
   match: Record<string, unknown>;
+  /** thresholds as written in the rule file */
   thresholds: Thresholds;
   baseline: { enabled: boolean; factor: number; min_pps: number; min_bps: number };
   conditions: {
@@ -330,6 +334,7 @@ export interface RuleView {
   match_summary: string;
   sustain_seconds: number;
   hold_down_seconds: number;
+  /** thresholds in force: file values with local overrides applied (before profile scaling) */
   base_thresholds: Thresholds;
   override?: { enabled?: boolean; pps?: number; bps?: number; fps?: number };
   effective: Record<string, { enabled: boolean; profile: string; pps: number; bps: number; fps: number }>;
@@ -454,22 +459,189 @@ export interface SimStatus {
   scenarios?: Scenario[];
 }
 
+// ---------------------------------------------------------------- admin
+
+export interface Me {
+  username: string;
+  role: "viewer" | "operator" | "admin";
+  objects: string[];
+  can_operate: boolean;
+  can_admin: boolean;
+  demo: boolean;
+  last_login?: number;
+}
+
+export interface UserRecord {
+  username: string;
+  role: string;
+  objects: string[];
+  disabled: boolean;
+  created_at: number;
+  last_login?: number;
+  tokens: { id: string; name: string; prefix: string; created_at: number; last_used?: number }[];
+}
+
+export interface AuditEntry {
+  t: number;
+  user: string;
+  role: string;
+  client: string;
+  action: string;
+  target?: string;
+  detail?: string;
+  ok: boolean;
+  error?: string;
+}
+
+export interface HistoryEntry {
+  id: string;
+  time: number;
+  actor: string;
+  comment: string;
+  restart_required?: string[];
+}
+
+export interface ChannelStatus {
+  name: string;
+  type: string;
+  enabled: boolean;
+  sent: number;
+  failed: number;
+  last_sent?: number;
+  last_error?: string;
+}
+
+export interface ChannelConfig {
+  name: string;
+  type: string;
+  enabled: boolean;
+  min_severity: string;
+  events: string[] | null;
+  url?: string;
+  secret?: string;
+  bot_token?: string;
+  chat_id?: string;
+  address?: string;
+  protocol?: string;
+  smtp_host?: string;
+  smtp_port?: number;
+  username?: string;
+  password?: string;
+  from?: string;
+  to?: string[];
+}
+
+export interface ObjectConfig {
+  name: string;
+  prefixes: string[];
+  profile: string;
+  link_capacity: number | string;
+  carpet_prefix_v4: number;
+  carpet_prefix_v6: number;
+  notes: string;
+}
+
+export interface ConfigDoc {
+  collector: {
+    listen: string[];
+    read_buffer_bytes: number;
+    queue_size: number;
+    default_sampling_rate: number;
+    workers: number;
+    allow: string[] | null;
+    forward: string[] | null;
+  };
+  api: { listen: string; tls_cert: string; tls_key: string; session_ttl: string; base_url: string; username: string; password: string };
+  engine: {
+    window: string;
+    max_flow_spread: string;
+    recent_flows: number;
+    baseline_tau: string;
+    baseline_learn: string;
+    near_miss_ratio: number;
+    signal_min_z: number;
+    signal_min_pps: number | string;
+    signal_min_bps: number | string;
+    signal_min_seconds: number;
+    incident_reopen: string;
+    evidence_every: string;
+    max_series: number;
+  };
+  exporters: { address: string; name: string; sampling_rate: number }[] | null;
+  protected_objects: ObjectConfig[];
+  rules_dir: string;
+  data_dir: string;
+  mitigation: {
+    mode: string;
+    driver: string;
+    default_ttl: string;
+    withdraw_after: string;
+    max_active: number;
+    min_prefix_v4: number;
+    min_prefix_v6: number;
+    allow_rtbh: boolean;
+    never_mitigate: string[] | null;
+    exabgp: { command_file: string; rtbh_next_hop: string; rtbh_community: string };
+    webhook: { url: string; secret: string };
+  };
+  notifications: { channels: ChannelConfig[] | null };
+  analyst: {
+    enabled: boolean;
+    provider: string;
+    model: string;
+    effort: string;
+    interval: string;
+    language: string;
+    max_turns: number;
+    max_tokens: number;
+    auto_run: boolean;
+    openai_compat: { base_url: string; model: string; api_key_env: string };
+  };
+  demo: { enabled: boolean; encoder: string; sampling_rate: number; target: string; baseline: boolean; baseline_bps: number | string };
+}
+
+export interface ConfigResponse {
+  config: ConfigDoc;
+  restart_pending: string[];
+  profiles: string[];
+  config_path: string;
+  /** false when the configuration file cannot be written (read-only mount) */
+  writable: boolean;
+  notification_events: string[];
+}
+
+// ---------------------------------------------------------------- transport
+
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (method !== "GET") headers["X-Requested-With"] = "ddosd";
   const res = await fetch("/api/v1" + path, {
     method,
-    headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+    headers,
+    credentials: "same-origin",
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
+  if (res.status === 401) window.dispatchEvent(new Event("ddosd:unauthorized"));
   const text = await res.text();
   let data: unknown = null;
   try {
     data = text ? JSON.parse(text) : null;
   } catch {
-    throw new Error(text || res.statusText);
+    if (!res.ok) throw new ApiError(res.status, text || res.statusText);
+    return text as unknown as T;
   }
   if (!res.ok) {
     const msg = (data as { error?: string } | null)?.error ?? res.statusText;
-    throw new Error(msg);
+    throw new ApiError(res.status, msg);
   }
   return data as T;
 }
@@ -477,5 +649,7 @@ async function req<T>(method: string, path: string, body?: unknown): Promise<T> 
 export const api = {
   get: <T,>(path: string) => req<T>("GET", path),
   post: <T,>(path: string, body: unknown = {}) => req<T>("POST", path, body),
+  put: <T,>(path: string, body: unknown) => req<T>("PUT", path, body),
   patch: <T,>(path: string, body: unknown) => req<T>("PATCH", path, body),
+  del: <T,>(path: string) => req<T>("DELETE", path),
 };

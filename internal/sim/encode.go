@@ -23,6 +23,16 @@ type Spec struct {
 	Packets          uint64 // real (unsampled) packets in this second
 	PktSize          uint16 // average packet size in bytes
 	Fragment         bool
+	// DurationMs is the flow duration reported by NetFlow/IPFIX encoders
+	// (0 = 1000 ms). Used to emulate exporter active/inactive timeouts.
+	DurationMs uint32
+}
+
+func (s Spec) duration() uint32 {
+	if s.DurationMs == 0 {
+		return 1000
+	}
+	return s.DurationMs
 }
 
 // Encoder turns specs into datagrams.
@@ -94,7 +104,7 @@ func (e *nf5Encoder) Encode(specs []Spec, now time.Time) [][]byte {
 		binary.BigEndian.PutUint16(r[14:16], 2)
 		binary.BigEndian.PutUint32(r[16:20], uint32(p))
 		binary.BigEndian.PutUint32(r[20:24], uint32(p*uint64(s.PktSize)))
-		binary.BigEndian.PutUint32(r[24:28], uptime-1000)
+		binary.BigEndian.PutUint32(r[24:28], uptime-s.duration())
 		binary.BigEndian.PutUint32(r[28:32], uptime)
 		sp, dp := ports(s)
 		binary.BigEndian.PutUint16(r[32:34], sp)
@@ -201,7 +211,7 @@ func (e *nf9Encoder) Encode(specs []Spec, now time.Time) [][]byte {
 			continue
 		}
 		r := encodeCommon(nil, s, p)
-		r = binary.BigEndian.AppendUint32(r, uptime-1000)
+		r = binary.BigEndian.AppendUint32(r, uptime-s.duration())
 		r = binary.BigEndian.AppendUint32(r, uptime)
 		r = binary.BigEndian.AppendUint32(r, e.rate)
 		if s.Src.Is4() {
@@ -304,7 +314,7 @@ func (e *ipfixEncoder) Encode(specs []Spec, now time.Time) [][]byte {
 			continue
 		}
 		r := encodeCommon(nil, s, p)
-		r = binary.BigEndian.AppendUint64(r, ms-1000)
+		r = binary.BigEndian.AppendUint64(r, ms-uint64(s.duration()))
 		r = binary.BigEndian.AppendUint64(r, ms)
 		if s.Src.Is4() {
 			v4 = append(v4, r)

@@ -16,6 +16,7 @@ rules:
     direction: inbound
     scope: host
     severity: high
+    generic: true
     match: { protocols: [udp] }
     thresholds: { pps: 200k, bps: 1Gbps }
     baseline: { enabled: true, factor: 5, min_pps: 30k, min_bps: 200Mbps }
@@ -133,6 +134,7 @@ rules:
     direction: inbound
     scope: host
     severity: medium
+    generic: true
     match: { protocols: [icmp, icmpv6] }
     thresholds: { pps: 50k, bps: 200Mbps }
     baseline: { enabled: true, factor: 10, min_pps: 10k }

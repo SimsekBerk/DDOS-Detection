@@ -3,7 +3,7 @@
 Bu doküman iki şeyi anlatır:
 
 1. **Üretim (production) mimarisi:** Operatör ölçeğinde (çoklu PoP, milyonlarca flow/sn) çalışacak hedef yapı.
-2. **Demo mimarisi:** Bu repodaki, tek binary olarak kendi ağınızda çalıştırabileceğiniz uygulama. Demo, üretim mimarisinin aynı mantıksal bileşenlerini tek süreçte çalıştırır; ölçek için değiştirilmesi gereken yerler en sonda tablo halinde verilmiştir.
+2. **Tek düğüm mimarisi (bu repo):** Tek binary olarak çalışan, oturum/RBAC, denetim kaydı, bildirimler ve arayüzden yapılandırma içeren uygulama. Üretim mimarisinin mantıksal bileşenlerini tek süreçte çalıştırır ve tek düğümde ~2M flow/sn işler (ölçüm: [BENCHMARK.md](BENCHMARK.md)). Çoklu PoP ölçeği için değiştirilmesi gereken yerler en sonda tablo halinde verilmiştir.
 
 ---
 
@@ -91,6 +91,10 @@ Bu doküman iki şeyi anlatır:
   - Dinamik baseline: EWMA ortalama ve varyans. Saldırı sırasında öğrenme dondurulur.
   - Ek koşullar: minimum benzersiz kaynak, ortalama paket boyu, minimum örnek sayısı.
 - Profiller (datacenter, dns_server, residential vb.) kural eşiklerini nesne tipine göre ölçekler veya kuralı kapatır.
+- **Hiyerarşik korelasyon:** Aynı saldırı birden fazla kurala uyar (DNS amplifikasyonu hem `amp_dns` hem "hosta tüm UDP" kuralına). `generic` işaretli genel kurallar ile prefix/nesne kapsamlı kurallar, aynı tick'teki özel vektörlerden sonra değerlendirilir. Aktif ve daha özel vektörler trafiğin en az %70'ini açıklıyorsa genel vektör raporlanmaz. Bir vektörün diğerini "açıklayabilmesi" için eşleşme kümesinin onun alt kümesi olması gerekir (ör. DNS amp ⊂ tüm UDP; TCP SYN ⊄ UDP). Bu ilişki kurallar yüklenirken bir kez hesaplanır (`rules.Set.Within`); böylece farklı türdeki eşzamanlı saldırılar birbirini bastırmaz.
+- **Aday sinyaller (AI analist için):** Eşiğin `near_miss_ratio` katını aşan ve yükselen, baseline'dan `signal_min_z` kadar sapan veya eşiği aşıp koşulu sağlamayan seriler, `signal_min_seconds` boyunca sürerse sinyal olur. Gürültü 1 saatte ≤1 sinyal seviyesine indirildi.
+- **Paralel sınıflandırma:** Kural eşleşmesi collector worker'larında yapılır; her kayıt hangi kurallara uyduğunu 128 bitlik bir maske ile motora taşır. Motor tek goroutine'de yalnızca toplama ve değerlendirme yapar.
+- **Bellek sınırı:** `max_series` aşılırsa yeni host serileri açılmaz (prefix/nesne serileri açılmaya devam eder). Rastgele hedefli geniş carpet saldırıları belleği tüketemez.
 
 **Olay yöneticisi**
 - Olay **hedef başına** tutulur. Aynı hedefe gelen birden fazla vektör (ör. DNS amp + NTP amp + SYN flood) tek olayın vektörleri olarak toplanır. Bu çok vektörlü saldırıların doğru temsilidir.
@@ -112,9 +116,12 @@ Bu doküman iki şeyi anlatır:
 **AI analist** (ayrıntı: §6)
 
 **API ve UI**
-- REST `/api/v1/*` ve canlı akış için SSE.
-- Üretimde OIDC ile RBAC; demoda basic auth.
-- Çok kiracılık: her sorgu kiracının prefix kümesiyle zorunlu olarak filtrelenir.
+- REST `/api/v1/*`, Prometheus `/metrics`, sağlık kontrolleri `/healthz` ve `/readyz`, opsiyonel TLS.
+- Kimlik doğrulama: kullanıcı/parola (bcrypt) ile HttpOnly + SameSite=Strict oturum çerezi veya otomasyon için `Authorization: Bearer` API token'ı. Kaba kuvvet denemeleri istemci başına 10 dakika engellenir. Durum değiştiren isteklerde CSRF başlığı (`X-Requested-With: ddosd`) zorunludur.
+- Roller: `viewer` (izler), `operator` (mitigasyon onaylar, analizi çalıştırır), `admin` (yapılandırma, kurallar, kullanıcılar). Son yönetici silinemez veya yetkisi düşürülemez.
+- Çok kiracılık: kullanıcıya nesne kapsamı verilirse tüm sorgular (olaylar, sinyaller, flow sorguları, mitigasyonlar, metrikler) o nesnelerle zorunlu olarak filtrelenir; altyapı uçları (exporter'lar, simülatör, sistem) kapsamlı kullanıcılara kapalıdır.
+- Denetim kaydı: her girişi ve değiştirici işlemi kim/ne zaman/nereden/ne değişti ile append-only dosyaya yazar.
+- Üretimde ek olarak OIDC/SAML ile tek oturum açma önerilir (yol haritası).
 
 ---
 
@@ -124,11 +131,13 @@ Bu doküman iki şeyi anlatır:
 Algılama süresi ≈ export gecikmesi + pencere doluluğu + sustain süresi + değerlendirme tick'i
 ```
 
-| Telemetri | Export gecikmesi | Önerilen ayar | Tipik algılama süresi |
+| Telemetri | Export gecikmesi | Önerilen ayar | Ölçülen algılama süresi (27 senaryo) |
 |---|---|---|---|
-| sFlow | ~1 sn (paket örnekleri anında gelir) | 1:1000–1:4000 örnekleme, counter interval 10–20 sn | **3–6 sn** |
+| sFlow | ~1 sn (paket örnekleri anında gelir) | 1:1000–1:4000 örnekleme, counter interval 10–20 sn | **3–11 sn** |
 | IPFIX / NetFlow v9 | active timeout | active 10 sn, inactive 15 sn | **12–20 sn** |
-| NetFlow v9 (varsayılan 60 sn active) | 60 sn | kısaltılmalı | 60+ sn |
+| NetFlow v9 (60 sn active) | 60 sn | kısaltılmalı | 18–62 sn |
+
+Ölçüm yöntemi ve tüm sonuçlar: [BENCHMARK.md](BENCHMARK.md).
 
 Önerilenler:
 - Mümkünse sFlow kullanın.
@@ -239,7 +248,7 @@ Kıdemli bir NOC analisti gibi çalışır. Her flow'a değil, **özet tabloya**
 
 ## 7. Ölçekleme notları (üretim)
 
-- **Collector:** UDP `SO_REUSEPORT` ve çekirdek başına okuyucu. Tek düğüm 1–2M flow/sn hedeflenir.
+- **Collector:** Bu repoda exporter adresine göre hash'lenen worker havuzu ve 1024 kayıt / 20 ms toplu gönderim var; tek exporter'dan UDP loopback ile 2M kayıt/sn kayıpsız ölçüldü. Bir exporter tek worker'a düştüğü için çok exporter'lı kurulumlar çekirdek sayısıyla ölçeklenir. Üretimde ek olarak UDP `SO_REUSEPORT` ile soket başına okuyucu önerilir.
 - **Algılama:** Kafka partition başına bir worker, durum (state) shard'a özel. Anahtar sayısı patladığında host kapsamı yalnızca "aktif" hedefler için tutulur (pencere içinde trafik görmeyen anahtarlar silinir).
 - **Benzersiz kaynak sayımı:** Demoda üst sınırlı küme, üretimde HyperLogLog.
 - **Top-N:** Demoda son flow halka tamponunda tarama, üretimde Space-Saving sketch ve ClickHouse.
@@ -247,29 +256,47 @@ Kıdemli bir NOC analisti gibi çalışır. Her flow'a değil, **özet tabloya**
 
 ---
 
-## 8. Demo mimarisi (bu repo)
+## 8. Tek düğüm mimarisi (bu repo)
 
 ```
 ddosd (tek Go binary)
- ├─ collector   UDP :2055 (NetFlow v5/v9/IPFIX), :4739 (IPFIX), :6343 (sFlow)
- ├─ decoder     netflow5 · netflow9 · ipfix · sflow (+ ham paket başlığı ayrıştırma)
- ├─ engine      tek goroutine'lik aggregator: kovalar, kurallar, baseline, olaylar, adaylar
+ ├─ collector   UDP dinleyiciler; exporter'a göre hash'lenen worker havuzu, izin listesi, flow yönlendirme (replikasyon)
+ ├─ decoder     netflow5 · netflow9 · ipfix · sflow (+ ham paket başlığı ayrıştırma); exporter başına şablon sınırı
+ ├─ engine      kovalar, kurallar, baseline, hiyerarşik korelasyon, olaylar, aday sinyaller, kanıt
  ├─ flowstore   son N flow halka tamponu (adli inceleme, top-N, flow explorer)
  ├─ mitigation  bariyerler, onay kuyruğu, dryrun/exabgp/webhook sürücüleri, vendor syntax önizleme
  ├─ analyst     aday sinyal kapısı, araçlar, anthropic/openai_compat/heuristic sağlayıcılar
- ├─ api         REST + SSE, basic auth, gömülü React UI
+ ├─ notify      Slack, Teams, Telegram, e-posta, syslog (RFC 5424), HMAC imzalı webhook
+ ├─ auth        kullanıcılar, roller, nesne kapsamı, oturumlar, API token'ları
+ ├─ audit       append-only denetim kaydı
+ ├─ app         yapılandırmayı doğrular, canlı uygular, sürümler ve geri alır
+ ├─ api         REST, /metrics, /healthz, /readyz, gömülü React UI
  └─ sim         (opsiyonel) sentetik trafik ve saldırı senaryoları; gerçek NetFlow/IPFIX/sFlow paketleri üretir
-ddos-sim        aynı simülatörün komut satırı versiyonu (başka bir makineden collector'a göndermek için)
+ddos-sim        simülatörün komut satırı versiyonu (başka bir makineden collector'a göndermek için)
+ddos-bench      doğruluk, algılama süresi, yanlış alarm ve kapasite ölçümü
 ```
 
-Demo ile üretim arasındaki farklar:
+### 8.1 Yapılandırmanın canlı uygulanması
 
-| Konu | Demo | Üretim |
+Arayüzden (Ayarlar) veya `PUT /api/v1/config` ile gelen değişiklik şu yoldan geçer:
+
+1. JSON çözülür (bilinmeyen alan reddedilir), maskelenmiş gizli alanlar (`********`) kayıtlı değerlerle doldurulur.
+2. Varsayılanlar uygulanır ve tüm yapılandırma doğrulanır; nesne profillerinin yüklü kural setinde olduğu kontrol edilir.
+3. Önce diske yazılır: önceki dosya `data/config-history/<sürüm>-onceki.yaml`, yeni dosya `<sürüm>.yaml` olarak saklanır (son 100 sürüm). Disk yazımı başarısız olursa hiçbir şey değişmez.
+4. Bileşenler canlı güncellenir: motor (nesneler isimle eşleştirilerek seri durumu korunur), collector politikası (izin listesi, örnekleme), mitigasyon politikası, analist sağlayıcısı, bildirim kanalları, oturum süresi.
+5. Yalnızca yeniden başlatmayla etkinleşen alanlar (dinleme adresleri, worker/kuyruk boyu, TLS, dizinler, flow deposu boyu, demo) "yeniden başlatma bekliyor" olarak gösterilir. Liste, sürecin başladığı yapılandırmayla karşılaştırılır; değişiklik geri alınırsa uyarı da kalkar.
+
+Kural eşiği ve aç/kapa değişiklikleri kural dosyalarından ayrı saklanır (`data/rule_overrides.json`) ve anında uygulanır; "varsayılana dön" ile kaldırılır.
+
+### 8.2 Tek düğüm ve çoklu PoP farkları
+
+| Konu | Bu repo (tek düğüm) | Çoklu PoP üretimi |
 |---|---|---|
-| Mesaj yolu | Go channel | Kafka/Redpanda |
+| Mesaj yolu | Go channel + worker havuzu | Kafka/Redpanda |
 | Ham flow deposu | Bellek içi halka tampon (varsayılan 500k kayıt) | ClickHouse |
 | Olay/bulgu deposu | JSON snapshot (`data/`) | PostgreSQL |
-| Ölçek | Tek düğüm, yaklaşık 100–300k flow/sn | Shard'lı, yatay |
+| Ölçek | Tek düğüm, ölçülen ~2M flow/sn | Shard'lı, yatay |
 | BGP | ExaBGP komut dosyası veya dry-run | GoBGP gRPC, çoklu route reflector |
-| Auth | Basic auth | OIDC + RBAC + audit |
-| Baseline | EWMA | Mevsimsel profil |
+| Kimlik | Yerel kullanıcılar + API token + RBAC + kiracı kapsamı + audit | + OIDC/SAML |
+| Baseline | EWMA | Mevsimsel profil (haftanın saati) |
+| Yüksek erişilebilirlik | Tek süreç (systemd/Docker yeniden başlatır) | Aktif/aktif collector, flow replikasyonu |

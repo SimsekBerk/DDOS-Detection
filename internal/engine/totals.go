@@ -251,3 +251,21 @@ func (t *Totals) Window(obj int, now, w int64) TotalPoint {
 	}
 	return toPoint(now, &sum)
 }
+
+// remap reorders per-object histories after the object list changed.
+func (t *Totals) remap(n int, idMap map[int32]int32) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	next := make([]*history, n)
+	for old, nid := range idMap {
+		if int(old) < len(t.objects) && int(nid) < n {
+			next[nid] = t.objects[old]
+		}
+	}
+	for i := range next {
+		if next[i] == nil {
+			next[i] = &history{}
+		}
+	}
+	t.objects = next
+}

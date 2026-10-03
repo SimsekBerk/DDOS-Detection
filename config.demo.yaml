@@ -1,6 +1,12 @@
 # Demo yapılandırması: tek komutla çalışır, sentetik trafik üretir.
 #   go run ./cmd/ddosd -config config.demo.yaml   →  http://localhost:8090
 #
+# Giriş: kullanıcı "admin". Parola ilk açılışta rastgele üretilir ve
+# data-demo/initial-admin-password.txt dosyasına yazılır:
+#   cat data-demo/initial-admin-password.txt
+# Unutursanız (servis kapalıyken):
+#   go run ./cmd/ddosd -config config.demo.yaml -reset-admin admin
+#
 # Simülatör gerçek NetFlow v9 paketleri üretip 127.0.0.1:2055'e gönderir;
 # yani decoder → motor → olay → mitigasyon → AI analist zincirinin tamamı
 # çalışır. "Simülatör" sayfasından saldırı senaryoları başlatabilirsiniz.
@@ -41,7 +47,8 @@ analyst:
   interval: 2m
 
 api:
-  listen: ":8090"
+  listen: ":8090"           # ağdan erişilebilir; giriş zorunlu (yalnızca bu makine için "127.0.0.1:8090")
+  username: admin
 
 demo:
   enabled: true

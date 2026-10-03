@@ -9,7 +9,7 @@ go run ./cmd/ddosd -config config.demo.yaml
 # veya: make run-demo
 ```
 
-1. `http://localhost:8090` adresini açın. Baseline trafik otomatik başlar.
+1. `http://localhost:8090` adresini açın ve `admin` kullanıcısıyla giriş yapın. Parola ilk açılışta `data-demo/initial-admin-password.txt` dosyasına yazılır (`cat data-demo/initial-admin-password.txt`). Baseline trafik otomatik başlar.
 2. **Simülatör** sayfasından senaryo başlatın. Beklenen sonuçlar:
 
 | Senaryo | Beklenen | Süre |
@@ -22,8 +22,9 @@ go run ./cmd/ddosd -config config.demo.yaml
 | Az Kaynaklı Yüksek Hacim | olay **yok**, `conditions_unmet` sinyali ("benzersiz kaynak 6 < 20") | ~5 sn |
 | Yavaş Yükselen UDP | baseline öğrenildikten sonra (demo: 3 dk) `baseline_deviation` | 3–5 dk |
 
-3. **AI Analist → "Bekleyen sinyalleri analiz et"** ile bulgu üretin. Bulgu sayfasında önerileri ("Onay kuyruğuna gönder" veya "Eşiği uygula") deneyin.
+3. **AI analist → "Sinyalleri analiz et"** ile bulgu üretin. Bulgu sayfasında önerileri ("Onay kuyruğuna gönder" veya "Eşiği uygula") deneyin.
 4. **Mitigasyon** sayfasında talepleri onaylayın veya reddedin. Sürücü `dryrun` olduğu için yalnızca loglanır.
+5. **Ayarlar → Bildirimler** ekranından bir kanal ekleyip "Test gönder" ile deneyin; **Ayarlar → Kullanıcılar** ekranından NOC (operator) ve müşteri (kapsamlı viewer) hesapları açın.
 
 Farklı telemetri formatlarını denemek için `config.demo.yaml` → `demo.encoder: sflow` ve `sampling_rate: 1000` yapın.
 
@@ -39,18 +40,18 @@ go run ./cmd/ddos-sim -collector 10.0.0.50:6343 -encoder sflow -sampling 1000 \
   -prefixes 203.0.113.0/24 -scenario carpet_ntp -target 203.0.113.0/24
 ```
 
-Simülatör makinesi **Telemetri Kaynakları** sayfasında ayrı bir exporter olarak görünür. Bu adım; UDP yolunu, firewall'ı, örnekleme ölçeklemesini ve kural eşiklerini kendi prefixlerinizle doğrular.
+Simülatör makinesi **Ayarlar → Telemetri** ekranında ayrı bir exporter olarak görünür. Bu adım; UDP yolunu, firewall'ı, örnekleme ölçeklemesini ve kural eşiklerini kendi prefixlerinizle doğrular.
 
 ## 3. Gerçek exporter: gölge mod (1–2 hafta)
 
 1. `config.example.yaml` dosyasını `config.yaml` olarak kopyalayın. Prefixlerinizi ve profilleri girin, `mitigation.mode: manual` ve `driver: dryrun` olarak bırakın. `never_mitigate` listesine resolver'larınızı, router loopback'lerinizi ve upstream peering IP'lerinizi ekleyin.
 2. Tek bir edge router'ı yönlendirin (bkz. [ROUTER-CONFIG.md](ROUTER-CONFIG.md)).
-3. **Telemetri Kaynakları** sayfasını kontrol edin:
+3. **Ayarlar → Telemetri** ekranını kontrol edin:
    - Örnekleme oranı doğru mu? Router'ın gerçek oranıyla aynı olmalı.
    - "Şablonsuz set" sadece açılışta mı artıyor?
    - "Kayıp" sıfır mı?
    - **Genel Bakış**'taki inbound trafik, router arayüz sayaçlarıyla (SNMP) ±%10 içinde mi?
-4. Gölge modda olayları ve aday sinyalleri izleyin. Yanlış alarm gördüğünüzde önce **profil** atayın (`dns_server`, `web`, `gaming`, `vpn_gateway`), sonra kural bazlı eşik ayarlayın. Bu sırada **Korunan Nesneler → Hedef analizi** ekranından yararlanın.
+4. Gölge modda olayları ve aday sinyalleri izleyin. Yanlış alarm gördüğünüzde önce **profil** atayın (`dns_server`, `web`, `gaming`, `vpn_gateway`), sonra kural bazlı eşik ayarlayın. Bu sırada **Trafik gezgini → Hedef analizi** ekranından yararlanın. Profil ve eşik değişikliklerini **Ayarlar** üzerinden yapın; her değişiklik sürümlenir ve geri alınabilir.
 5. Kabul kriterleri:
    - 1 hafta boyunca operatörün "gerçek değil" dediği yüksek önemli olay sayısı 0 olmalı.
    - Simülatör senaryolarının hepsi beklenen sürede yakalanmalı.
@@ -82,6 +83,35 @@ Ayrıntılar için: [AI-ANALYST.md](AI-ANALYST.md).
 ## Otomatik testler
 
 ```bash
-go test ./...          # decoder round-trip, kural eşleşmeleri, motor senaryoları, FlowSpec render, analist doğrulama
-cd web && npm run build
+make test          # go test ./...
+make test-race     # go test -race -short ./...
+make fuzz          # decoder'ı 60 sn rastgele/bozuk paketlerle zorlar
+cd web && npm run build   # TypeScript tip kontrolü + üretim derlemesi
 ```
+
+Kapsam:
+
+| Paket | Ne test ediliyor |
+|---|---|
+| `decoder` | NetFlow v5/v9, IPFIX, sFlow round-trip; IPFIX options template ile örnekleme; bozuk paketler; fuzz |
+| `rules` | gönderilen kural setinin yüklenmesi, eşleşmeler, profil ölçekleme, kurallar arası alt küme/ayrıklık ilişkileri |
+| `engine` | DNS amp algılama ve bitiş, sustain, koşul sağlanmadı sinyali, carpet bombing, eşzamanlı farklı carpet saldırıları, baseline sapması, öğrenme dönemi sinyalleri |
+| `collector` | UDP alım + decode, flow yönlendirme (replikasyon), izin listesi ve canlı güncellenmesi |
+| `mitigation` | kanıttan FlowSpec üretimi, vendor çıktıları, FlowSpec doğrulaması |
+| `analyst` | bulgu (submit_finding) doğrulaması, araç şemaları |
+| `auth`, `audit` | bootstrap, giriş, kaba kuvvet engeli, roller, kapsam, token'lar, son yönetici koruması, parola sıfırlama; denetim kaydı |
+| `notify` | kanallara teslim, önem/olay filtreleme, HMAC imzası |
+| `config`, `app` | örnek yapılandırmalar, doğrulama mesajları, YAML gidiş-dönüş, gizli alan maskeleme, salt okunur dizinde yazma |
+| `api` | RBAC + CSRF, kiracı kapsamı ve token'lar, yapılandırmanın canlı uygulanması ve geri yüklenmesi, yeniden başlatma uyarısının geri alınması, metrikler ve dışa aktarma, bildirim testi |
+| `bench` | seçili senaryoların regresyon testi (algılama + bitiş) ve normal trafikte yanlış alarm testi |
+
+## Doğruluk ve kapasite ölçümü (`ddos-bench`)
+
+```bash
+go run ./cmd/ddos-bench detect                     # 27 senaryo × 4 telemetri: algılama, algılama süresi, bitiş
+go run ./cmd/ddos-bench baseline -baseline-minutes 120 -phases 6   # yalnızca normal trafik: yanlış alarm
+go run ./cmd/ddos-bench throughput                 # decode, motor ve UDP uçtan uca kapasite
+go run ./cmd/ddos-bench all -json sonuc.json       # hepsi + JSON çıktı
+```
+
+Senaryolar simüle saatle, gerçek decoder ve motor üzerinden çalışır; router flow önbelleğinin active/inactive timeout davranışı taklit edilir. Bu yüzden 2 saatlik bir yanlış alarm testi birkaç saniye sürer. Son sonuçlar ve GenieATM karşılaştırması: [BENCHMARK.md](BENCHMARK.md).

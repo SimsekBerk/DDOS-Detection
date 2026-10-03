@@ -57,12 +57,32 @@ type samplingKey struct {
 	domain   uint32
 }
 
+// MaxTemplatesPerExporter bounds template state so a misbehaving or spoofed
+// exporter cannot exhaust memory.
+const MaxTemplatesPerExporter = 1024
+
 // Decoder is safe for concurrent use.
 type Decoder struct {
 	mu       sync.Mutex
 	nf9      map[tmplKey]*template
 	ipfix    map[tmplKey]*template
 	sampling map[samplingKey]uint32
+	perExp   map[netip.Addr]int
+	Rejected uint64 // templates rejected by the per-exporter limit
+}
+
+// storeTemplate saves a template unless the exporter is over its limit.
+// Caller must hold d.mu.
+func (d *Decoder) storeTemplate(m map[tmplKey]*template, k tmplKey, t *template) bool {
+	if _, exists := m[k]; !exists {
+		if d.perExp[k.exporter] >= MaxTemplatesPerExporter {
+			d.Rejected++
+			return false
+		}
+		d.perExp[k.exporter]++
+	}
+	m[k] = t
+	return true
 }
 
 func New() *Decoder {
@@ -70,6 +90,7 @@ func New() *Decoder {
 		nf9:      make(map[tmplKey]*template),
 		ipfix:    make(map[tmplKey]*template),
 		sampling: make(map[samplingKey]uint32),
+		perExp:   make(map[netip.Addr]int),
 	}
 }
 

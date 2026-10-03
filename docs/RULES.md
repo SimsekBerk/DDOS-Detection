@@ -19,7 +19,7 @@
 3. **Çift tetik.** Statik eşik *veya* dinamik baseline (`factor × EWMA`, `min_pps`/`min_bps` tabanıyla) tetikler. Küçük baseline'larda yanlış alarmı taban değerler önler. Saldırı sırasında baseline öğrenmesi durur, aykırı değerler kırpılır (μ+3σ).
 4. **Doğrulama koşulları.** Yansıtma için `min_unique_sources` aranır: binlerce yansıtıcı tek bir meşru sunucudan ayrılır. Carpet bombing için `min_unique_destinations` aranır: tek hosta yönelik saldırı prefix kuralını tetiklemez. Koşulu sağlanmayan tetikler kaybolmaz; AI analiste `conditions_unmet` sinyali olarak iletilir.
 5. **Histerezis.**
-   - Başlangıç: pencere ortalaması `sustain` saniye boyunca eşiği aşmalı **ve** son saniyede de trafik sürmeli. Böylece kayan pencerede kalan tek bir sıçrama tetik üretmez.
+   - Başlangıç: pencere ortalaması `sustain` değerlendirme boyunca üst üste eşiği aşmalı **ve** pencerede en az 2 ayrı saniyede trafik görülmeli. Böylece kayan pencerede kalan tek bir sıçrama tetik üretmez; NetFlow/IPFIX'in toplu (bursty) export'u ise doğru sayılır.
    - Bitiş: `hold_down` süresince eşiğin %70'inin altında kalmalı.
 6. **Kapsam.**
    - `host`: tek IP.
@@ -27,6 +27,8 @@
    - `object`: müşterinin tamamı.
 
    Aynı hedefe gelen tüm vektörler tek olayda toplanır.
+
+   **Genel kurallar ve korelasyon.** `generic: true` işaretli kurallar ("hosta tüm UDP", "nesneye toplam trafik" gibi) güvenlik ağıdır. Aynı saldırıyı daha özel bir kural zaten yakaladıysa ve o vektörler trafiğin en az %70'ini açıklıyorsa genel vektör ayrıca raporlanmaz. Bir vektör yalnızca kendi trafiği diğer kuralın trafiğinin alt kümesiyse onu açıklayabilir: DNS amplifikasyonu "tüm UDP"yi açıklar, carpet SYN ise carpet UDP amplifikasyonunu açıklamaz. Böylece aynı /24'e eşzamanlı gelen farklı türdeki saldırılar ayrı vektörler olarak görünür.
 7. **En dar mitigasyon.**
    - Spoof'lu saldırılarda FlowSpec kaynak IP kullanmaz; hedef /32, protokol, kaynak port ve paket boyu kullanılır.
    - SYN, ACK, PSH-ACK, QUIC ve DNS sorgu seli gibi meşru trafiğe benzeyen vektörlerde aksiyon **scrubbing**'dir. Discard servisi keser, yani saldırganın işini yapar.
@@ -44,6 +46,7 @@
   description: ...
   direction: inbound                # inbound | outbound
   scope: host                       # host | prefix | object
+  generic: false                    # true: genel güvenlik ağı kuralı (özel vektörler açıklıyorsa bastırılır)
   severity: high                    # low | medium | high | critical
   enabled: true
   match:
@@ -122,7 +125,7 @@ HTTP flood'lar, Slowloris/RUDY, TLS renegotiation, DNS water torture (rastgele a
 | `tcp_invalid_flags`<br>TCP NULL Paketleri (flag yok) | `proto=tcp tcp=none` | inbound/host | 5kpps · 20Mbps | — | — | 3s / 60s | FlowSpec discard |
 | `tcp_xmas_synfin`<br>TCP XMAS / SYN+FIN | `proto=tcp tcp=+fin any(syn,urg)` | inbound/host | 2kpps · 10Mbps | — | — | 3s / 60s | FlowSpec discard |
 | `tcp_psh_ack_flood`<br>TCP PSH-ACK Flood | `proto=tcp tcp=+psh+ack !syn` | inbound/host | 500kpps · 4Gbps | ×6 (min 100kpps / 1Gbps) | ≥200 kaynak | 10s / 60s | Scrubbing (RTBH eskalasyon %80) |
-| `tcp_conn_flood`<br>TCP Bağlantı Seli (yeni flow oranı) | `proto=tcp` | inbound/host | 30kfps | ×8 (min 20kpps) | — | 10s / 60s | Scrubbing |
+| `tcp_conn_flood`<br>TCP Bağlantı Seli (yeni flow oranı) | `proto=tcp tcp=+syn+ack any(psh,fin)` | inbound/host | 30kfps | — | — | 10s / 60s | Scrubbing |
 | `tcp_flood_generic`<br>TCP Hacimsel Flood (genel) | `proto=tcp` | inbound/host | 1Mpps · 5Gbps | ×5 (min 100kpps / 1Gbps) | ≥50 kaynak | 10s / 90s | Scrubbing (RTBH eskalasyon %80) |
 
 ### Altyapı / Kontrol düzlemi (1)

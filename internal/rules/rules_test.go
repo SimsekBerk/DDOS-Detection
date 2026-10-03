@@ -108,3 +108,67 @@ func TestProfileScaling(t *testing.T) {
 		t.Error("override did not disable rule")
 	}
 }
+
+func TestWithinRelation(t *testing.T) {
+	s := load(t)
+	idx := func(id string) int {
+		c, ok := s.ByID[id]
+		if !ok {
+			t.Fatalf("rule %q missing", id)
+		}
+		return c.Index
+	}
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"amp_dns", "udp_flood_host", true},
+		{"amp_dns", "carpet_amplification", true},
+		{"amp_dns", "total_host", true},
+		{"carpet_amplification", "carpet_udp", true},
+		{"tcp_syn_flood", "tcp_flood_generic", true},
+		{"carpet_syn", "carpet_udp", false},
+		{"carpet_syn", "carpet_amplification", false},
+		{"carpet_amplification", "carpet_syn", false},
+		{"udp_flood_host", "amp_dns", false},
+		{"tcp_syn_flood", "udp_flood_host", false},
+		{"out_syn_flood", "total_host", false}, // direction differs
+	} {
+		if got := s.Within(idx(tc.a), idx(tc.b)); got != tc.want {
+			t.Errorf("Within(%s, %s) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+	// Every rule is within itself.
+	for _, c := range s.Rules {
+		if !s.Within(c.Index, c.Index) {
+			t.Errorf("rule %s not within itself", c.ID)
+		}
+	}
+}
+
+func TestDisjointRelation(t *testing.T) {
+	s := load(t)
+	idx := func(id string) int { return s.ByID[id].Index }
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"amp_memcached", "udp_fragment_flood", true}, // port match never matches fragments
+		{"amp_dns", "amp_ntp", true},                  // different source ports
+		{"tcp_syn_flood", "amp_dns", true},            // different protocols
+		{"tcp_syn_flood", "tcp_ack_flood", true},      // SYN without ACK vs ACK
+		{"amp_dns", "amp_generic_lowport", false},     // 53 is a low port
+		{"amp_dns", "udp_flood_host", false},
+		{"tcp_fin_flood", "tcp_xmas_synfin", false}, // both carry FIN
+	} {
+		if got := s.Disjoint(idx(tc.a), idx(tc.b)); got != tc.want {
+			t.Errorf("Disjoint(%s, %s) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+		if s.Disjoint(idx(tc.a), idx(tc.b)) != s.Disjoint(idx(tc.b), idx(tc.a)) {
+			t.Errorf("Disjoint(%s, %s) not symmetric", tc.a, tc.b)
+		}
+	}
+	if s.Breadth(idx("total_host")) <= s.Breadth(idx("udp_flood_host")) {
+		t.Error("total_host should be broader than udp_flood_host")
+	}
+}

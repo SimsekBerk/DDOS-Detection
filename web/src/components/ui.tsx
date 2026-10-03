@@ -1,49 +1,63 @@
-import { ReactNode, useState } from "react";
+import { cloneElement, createContext, isValidElement, ReactElement, ReactNode, useId, useState } from "react";
 import { Row } from "../api";
-import { bps, pps, pct, severityLabel } from "../lib";
+import { bps, pct, pps, severityLabel } from "../lib";
 
-export function Card(props: { title?: ReactNode; actions?: ReactNode; children: ReactNode; className?: string; pad?: boolean }) {
+export function PageHead(props: { title: ReactNode; desc?: ReactNode; crumb?: ReactNode; actions?: ReactNode }) {
   return (
-    <section className={"card " + (props.className ?? "")}>
-      {(props.title || props.actions) && (
-        <header className="card-h">
-          <h3>{props.title}</h3>
-          <div className="card-actions">{props.actions}</div>
-        </header>
-      )}
-      <div className={props.pad === false ? "" : "card-b"}>{props.children}</div>
-    </section>
-  );
-}
-
-export function Stat(props: { label: string; value: ReactNode; sub?: ReactNode; tone?: string; onClick?: () => void }) {
-  return (
-    <div className={"stat " + (props.tone ?? "") + (props.onClick ? " clickable" : "")} onClick={props.onClick}>
-      <div className="stat-l">{props.label}</div>
-      <div className="stat-v">{props.value}</div>
-      {props.sub && <div className="stat-s">{props.sub}</div>}
+    <div className="page-head">
+      <div>
+        {props.crumb && <div className="crumb">{props.crumb}</div>}
+        <h1>{props.title}</h1>
+        {props.desc && <p>{props.desc}</p>}
+      </div>
+      {props.actions && <div className="row">{props.actions}</div>}
     </div>
   );
 }
 
-export function Sev({ s }: { s: string }) {
-  return <span className={"badge sev-" + s}>{severityLabel[s] ?? s}</span>;
+export function Card(props: { title?: ReactNode; actions?: ReactNode; children: ReactNode; flush?: boolean; className?: string }) {
+  return (
+    <section className={"card " + (props.className ?? "")}>
+      {(props.title || props.actions) && (
+        <div className="card-head">
+          {props.title && <h2>{props.title}</h2>}
+          {props.actions && <div className="actions">{props.actions}</div>}
+        </div>
+      )}
+      {props.flush ? props.children : <div className="card-body">{props.children}</div>}
+    </section>
+  );
 }
 
-const statusTone: Record<string, string> = {
-  active: "tone-red",
-  ended: "tone-gray",
-  pending: "tone-amber",
-  withdrawn: "tone-gray",
-  rejected: "tone-gray",
-  failed: "tone-red",
-  expired: "tone-gray",
-  ok: "tone-green",
-  error: "tone-red",
-  running: "tone-blue",
-};
+export function Kpi(props: { label: string; value: ReactNode; sub?: ReactNode; onClick?: () => void }) {
+  return (
+    <div className={"kpi" + (props.onClick ? " clickable" : "")} onClick={props.onClick} role={props.onClick ? "button" : undefined}>
+      <div className="kpi-label">{props.label}</div>
+      <div className="kpi-value num">{splitUnit(props.value)}</div>
+      {props.sub !== undefined && <div className="kpi-sub">{props.sub}</div>}
+    </div>
+  );
+}
 
-const statusLabel: Record<string, string> = {
+// splitUnit renders "396.76 Mbps" as a large number with a small unit so
+// values fit narrow KPI tiles without truncation.
+function splitUnit(v: ReactNode): ReactNode {
+  if (typeof v !== "string") return v;
+  const m = /^([-+]?[\d.,]+)\s+(\p{L}.*)$/u.exec(v);
+  if (!m) return v;
+  return (
+    <>
+      {m[1]}
+      <span className="unit">{m[2]}</span>
+    </>
+  );
+}
+
+export function Sev({ s }: { s: string }) {
+  return <span className={"sev " + s}>{severityLabel[s] ?? s}</span>;
+}
+
+const statusText: Record<string, string> = {
   active: "Aktif",
   ended: "Bitti",
   pending: "Onay bekliyor",
@@ -55,17 +69,27 @@ const statusLabel: Record<string, string> = {
   error: "Hata",
   running: "Çalışıyor",
 };
+const statusClass: Record<string, string> = { active: "active", pending: "pending", failed: "err", error: "err", ok: "ok", running: "pending" };
 
 export function Status({ s, label }: { s: string; label?: string }) {
-  return <span className={"badge " + (statusTone[s] ?? "tone-gray")}>{label ?? statusLabel[s] ?? s}</span>;
+  return <span className={"pill " + (statusClass[s] ?? "")}>{label ?? statusText[s] ?? s}</span>;
 }
 
-export function Tag({ children, tone }: { children: ReactNode; tone?: string }) {
-  return <span className={"tag " + (tone ?? "")}>{children}</span>;
+export function Tag({ children, title }: { children: ReactNode; title?: string }) {
+  return (
+    <span className="tag" title={title}>
+      {children}
+    </span>
+  );
 }
 
 export function Empty({ children }: { children: ReactNode }) {
   return <div className="empty">{children}</div>;
+}
+
+export function ErrorLine({ error }: { error: string | null | undefined }) {
+  if (!error) return null;
+  return <div className="alert-line">{error}</div>;
 }
 
 export function Tabs<T extends string>(props: { tabs: { id: T; label: ReactNode }[]; value: T; onChange: (v: T) => void }) {
@@ -80,14 +104,26 @@ export function Tabs<T extends string>(props: { tabs: { id: T; label: ReactNode 
   );
 }
 
+export function Seg<T extends string>(props: { options: { id: T; label: ReactNode }[]; value: T; onChange: (v: T) => void }) {
+  return (
+    <div className="seg">
+      {props.options.map((o) => (
+        <button key={o.id} className={props.value === o.id ? "on" : ""} onClick={() => props.onChange(o.id)}>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function Code({ text, label }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   return (
     <div className="code">
-      <div className="code-h">
+      <div className="code-head">
         <span>{label}</span>
         <button
-          className="btn tiny ghost"
+          className="btn ghost sm"
           onClick={() => {
             void navigator.clipboard?.writeText(text);
             setCopied(true);
@@ -102,24 +138,28 @@ export function Code({ text, label }: { text: string; label?: string }) {
   );
 }
 
-/** Bars renders a top-N list as horizontal share bars. */
-export function Bars(props: { rows: Row[] | undefined | null; metric?: "bps" | "pps"; onClick?: (key: string) => void; limit?: number }) {
-  const rows = (props.rows ?? []).slice(0, props.limit ?? 10);
+/** Bars shows a top-N list: label, value and share, with a thin magnitude bar. */
+export function Bars(props: { rows: Row[] | null | undefined; metric?: "bps" | "pps"; limit?: number; onClick?: (key: string) => void }) {
+  const rows = (props.rows ?? []).slice(0, props.limit ?? 8);
   if (rows.length === 0) return <Empty>Veri yok</Empty>;
-  const metric = props.metric ?? "bps";
-  const max = Math.max(...rows.map((r) => (metric === "pps" ? r.pps : r.bps)), 1);
+  const m = props.metric ?? "bps";
+  const max = Math.max(...rows.map((r) => (m === "pps" ? r.pps : r.bps)), 1);
   return (
     <div className="bars">
       {rows.map((r) => {
-        const v = metric === "pps" ? r.pps : r.bps;
+        const v = m === "pps" ? r.pps : r.bps;
         return (
-          <div key={r.key} className={"bar-row" + (props.onClick ? " clickable" : "")} onClick={() => props.onClick?.(r.key)} title={r.key}>
-            <div className="bar-k mono">{r.key}</div>
-            <div className="bar-track">
-              <div className="bar-fill" style={{ width: (100 * v) / max + "%" }} />
+          <div key={r.key} className="bar" title={r.key}>
+            <div className="bar-label">
+              <span className={"mono" + (props.onClick ? " link" : "")} onClick={() => props.onClick?.(r.key)}>
+                {r.key}
+              </span>
+              <div className="bar-track">
+                <div className="bar-fill" style={{ width: (100 * v) / max + "%" }} />
+              </div>
             </div>
-            <div className="bar-v mono">{metric === "pps" ? pps(r.pps) : bps(r.bps)}</div>
-            <div className="bar-p mono">{pct(r.share)}</div>
+            <div className="num r">{m === "pps" ? pps(r.pps) : bps(r.bps)}</div>
+            <div className="num r muted">{pct(r.share)}</div>
           </div>
         );
       })}
@@ -131,7 +171,7 @@ export function KV({ items }: { items: [ReactNode, ReactNode][] }) {
   return (
     <dl className="kv">
       {items.map(([k, v], i) => (
-        <div key={i}>
+        <div key={i} style={{ display: "contents" }}>
           <dt>{k}</dt>
           <dd>{v}</dd>
         </div>
@@ -140,33 +180,51 @@ export function KV({ items }: { items: [ReactNode, ReactNode][] }) {
   );
 }
 
-export function Meter({ value, max = 1, tone }: { value: number; max?: number; tone?: string }) {
-  const p = Math.max(0, Math.min(1, value / (max || 1)));
-  const t = tone ?? (p >= 1 ? "red" : p >= 0.7 ? "amber" : p >= 0.5 ? "yellow" : "green");
+export function Meter({ value }: { value: number }) {
+  const p = Math.max(0, Math.min(1, value));
+  const cls = value >= 1 ? "hot" : value >= 0.7 ? "warn" : "";
   return (
-    <div className="meter" title={(p * 100).toFixed(0) + "%"}>
-      <div className={"meter-f m-" + t} style={{ width: p * 100 + "%" }} />
+    <div className={"meter " + cls} title={(value * 100).toFixed(0) + "%"}>
+      <div style={{ width: p * 100 + "%" }} />
     </div>
   );
 }
 
-export function Modal(props: { title: ReactNode; onClose: () => void; children: ReactNode; wide?: boolean }) {
+export function Modal(props: { title: ReactNode; onClose: () => void; children: ReactNode; wide?: boolean; footer?: ReactNode }) {
   return (
     <div className="modal-bg" onClick={props.onClose}>
       <div className={"modal" + (props.wide ? " wide" : "")} onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
-        <header>
-          <h3>{props.title}</h3>
-          <button className="btn ghost" onClick={props.onClose} aria-label="Kapat">
+        <div className="modal-head">
+          <h2>{props.title}</h2>
+          <button className="btn ghost sm right" onClick={props.onClose} aria-label="Kapat">
             ✕
           </button>
-        </header>
-        <div className="modal-b">{props.children}</div>
+        </div>
+        <div className="modal-body">
+          {props.children}
+          {props.footer && <div className="row end" style={{ marginTop: 16 }}>{props.footer}</div>}
+        </div>
       </div>
     </div>
   );
 }
 
-export function ErrorLine({ error }: { error: string | null }) {
-  if (!error) return null;
-  return <div className="error-line">API hatası: {error}</div>;
+/** FieldId lets inputs nested inside a Field pick up the id its label points to. */
+export const FieldId = createContext<string | undefined>(undefined);
+
+export function Field(props: { label: ReactNode; hint?: ReactNode; children: ReactNode; full?: boolean }) {
+  const id = useId();
+  // A single native control gets the id directly; composite inputs read it
+  // from FieldId so the label is announced and clickable either way.
+  let child = props.children;
+  if (isValidElement(child) && typeof child.type === "string" && ["input", "select", "textarea"].includes(child.type)) {
+    child = cloneElement(child as ReactElement<{ id?: string }>, { id });
+  }
+  return (
+    <div className={"field" + (props.full ? " full" : "")}>
+      <label htmlFor={id}>{props.label}</label>
+      <FieldId.Provider value={id}>{child}</FieldId.Provider>
+      {props.hint && <div className="hint">{props.hint}</div>}
+    </div>
+  );
 }

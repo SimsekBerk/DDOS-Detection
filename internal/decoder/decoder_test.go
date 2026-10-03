@@ -135,3 +135,17 @@ func TestGarbage(t *testing.T) {
 		}
 	}
 }
+
+// FuzzDecode ensures arbitrary datagrams never panic the decoder.
+func FuzzDecode(f *testing.F) {
+	for _, kind := range []string{"netflow5", "netflow9", "ipfix", "sflow"} {
+		for _, dg := range sim.NewEncoder(kind, 10).Encode(specs(), time.Now()) {
+			f.Add(dg)
+		}
+	}
+	dec := decoder.New()
+	exp := netip.MustParseAddr("127.0.0.9")
+	f.Fuzz(func(t *testing.T, b []byte) {
+		_, _ = dec.Decode(exp, b, 0)
+	})
+}

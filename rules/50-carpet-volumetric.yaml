@@ -38,6 +38,7 @@ rules:
     direction: inbound
     scope: prefix
     severity: high
+    generic: true
     match: { protocols: [udp] }
     thresholds: { pps: 500k, bps: 3Gbps }
     baseline: { enabled: true, factor: 5, min_pps: 100k, min_bps: 1Gbps }
@@ -95,6 +96,7 @@ rules:
     direction: inbound
     scope: host
     severity: high
+    generic: true
     match: {}
     thresholds: { pps: 1.5M, bps: 8Gbps }
     baseline: { enabled: true, factor: 6, min_pps: 200k, min_bps: 2Gbps }
@@ -108,6 +110,7 @@ rules:
     direction: inbound
     scope: object
     severity: high
+    generic: true
     match: {}
     thresholds: { bps: 40Gbps }
     baseline: { enabled: true, factor: 4, min_pps: 500k, min_bps: 4Gbps }
@@ -121,6 +124,7 @@ rules:
     direction: inbound
     scope: object
     severity: medium
+    generic: true
     match: { protocols: [udp] }
     thresholds: { bps: 20Gbps }
     baseline: { enabled: true, factor: 5, min_pps: 200k, min_bps: 2Gbps }

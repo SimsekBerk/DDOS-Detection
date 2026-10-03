@@ -49,6 +49,9 @@ type Analyst struct {
 	log      *slog.Logger
 	note     string
 
+	// OnFinding is called (in a goroutine) when an analysis completes.
+	OnFinding func(f *Finding)
+
 	mu       sync.Mutex
 	findings map[string]*Finding
 	seq      int
@@ -61,26 +64,7 @@ type Analyst struct {
 // New creates the analyst with the configured provider.
 func New(cfg *config.Config, eng *engine.Engine, col *collector.Collector, log *slog.Logger) *Analyst {
 	a := &Analyst{cfg: cfg.Analyst, eng: eng, log: log, findings: map[string]*Finding{}, toolMap: map[string]Tool{}}
-	switch cfg.Analyst.Provider {
-	case "anthropic":
-		if os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
-			a.provider = heuristicProvider{}
-			a.note = "ANTHROPIC_API_KEY tanımlı değil; kural tabanlı (heuristic) analiste düşüldü."
-			log.Warn("analyst: ANTHROPIC_API_KEY not set, falling back to heuristic provider")
-		} else {
-			a.provider = newAnthropic(cfg.Analyst.Model, cfg.Analyst.Effort, cfg.Analyst.MaxTokens)
-		}
-	case "openai_compat":
-		model := cfg.Analyst.OpenAICompat.Model
-		if model == "" {
-			a.provider = heuristicProvider{}
-			a.note = "analyst.openai_compat.model tanımlı değil; heuristic analiste düşüldü."
-		} else {
-			a.provider = newOpenAICompat(cfg.Analyst.OpenAICompat.BaseURL, model, cfg.Analyst.OpenAICompat.APIKeyEnv)
-		}
-	default:
-		a.provider = heuristicProvider{}
-	}
+	a.provider, a.note = newProvider(cfg.Analyst, log)
 	a.tools = buildTools(eng, col)
 	for _, t := range a.tools {
 		a.toolMap[t.Name] = t
@@ -98,6 +82,32 @@ func New(cfg *config.Config, eng *engine.Engine, col *collector.Collector, log *
 	return a
 }
 
+func newProvider(c config.AnalystConfig, log *slog.Logger) (Provider, string) {
+	switch c.Provider {
+	case "anthropic":
+		if os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
+			log.Warn("analyst: ANTHROPIC_API_KEY not set, falling back to heuristic provider")
+			return heuristicProvider{}, "ANTHROPIC_API_KEY tanımlı değil; kural tabanlı (heuristic) analiste düşüldü."
+		}
+		return newAnthropic(c.Model, c.Effort, c.MaxTokens), ""
+	case "openai_compat":
+		if c.OpenAICompat.Model == "" {
+			return heuristicProvider{}, "analyst.openai_compat.model tanımlı değil; heuristic analiste düşüldü."
+		}
+		return newOpenAICompat(c.OpenAICompat.BaseURL, c.OpenAICompat.Model, c.OpenAICompat.APIKeyEnv), ""
+	}
+	return heuristicProvider{}, ""
+}
+
+// UpdateConfig applies analyst settings at runtime (a running analysis
+// finishes with the provider it started with).
+func (a *Analyst) UpdateConfig(cfg *config.Config) {
+	p, note := newProvider(cfg.Analyst, a.log)
+	a.mu.Lock()
+	a.cfg, a.provider, a.note = cfg.Analyst, p, note
+	a.mu.Unlock()
+}
+
 // Status returns the analyst status.
 func (a *Analyst) Status() Status {
 	a.mu.Lock()
@@ -112,16 +122,21 @@ func (a *Analyst) Status() Status {
 
 // Loop runs scheduled analyses: only when there are pending signals (gate).
 func (a *Analyst) Loop(ctx context.Context) {
-	if !a.cfg.Enabled || !a.cfg.AutoRun {
-		return
-	}
-	t := time.NewTicker(a.cfg.Interval.Duration)
+	t := time.NewTicker(15 * time.Second)
 	defer t.Stop()
+	var last time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case now := <-t.C:
+			a.mu.Lock()
+			cfg := a.cfg
+			a.mu.Unlock()
+			if !cfg.Enabled || !cfg.AutoRun || now.Sub(last) < cfg.Interval.Duration {
+				continue
+			}
+			last = now
 			if len(a.eng.Signals().List(true, 3, 0)) == 0 {
 				continue // nothing new: no model call, no cost
 			}
@@ -157,10 +172,11 @@ func (a *Analyst) Ask(ctx context.Context, q string) (string, error) {
 
 // Start launches an analysis in the background and returns the finding id.
 func (a *Analyst) Start(parent context.Context, t task) (string, error) {
+	a.mu.Lock()
 	if !a.cfg.Enabled {
+		a.mu.Unlock()
 		return "", errors.New("analist yapılandırmada kapalı (analyst.enabled)")
 	}
-	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
 		return "", errBusy
@@ -169,17 +185,18 @@ func (a *Analyst) Start(parent context.Context, t task) (string, error) {
 	a.seq++
 	id := fmt.Sprintf("FND-%05d", a.seq)
 	a.current = id
+	prov, cfg := a.provider, a.cfg
 	a.mu.Unlock()
-	go a.run(context.WithoutCancel(parent), id, t)
+	go a.run(context.WithoutCancel(parent), id, t, prov, cfg)
 	return id, nil
 }
 
-func (a *Analyst) run(parent context.Context, id string, t task) {
+func (a *Analyst) run(parent context.Context, id string, t task, prov Provider, cfg config.AnalystConfig) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(withTask(parent, t), 6*time.Minute)
 	defer cancel()
 	f := &Finding{
-		ID: id, CreatedAt: start.Unix(), Mode: t.Mode, Provider: a.provider.Name(), Model: a.provider.Model(),
+		ID: id, CreatedAt: start.Unix(), Mode: t.Mode, Provider: prov.Name(), Model: prov.Model(),
 		Question: t.Question, IncidentID: t.IncidentID, SignalIDs: t.SignalIDs, Status: "ok",
 		Evidence: []EvidenceItem{}, Recommendations: []Recommendation{}, Trace: []TraceStep{},
 	}
@@ -224,7 +241,7 @@ func (a *Analyst) run(parent context.Context, id string, t task) {
 	case "question":
 		user = userPromptQuestion(t.Question)
 	}
-	usage, err := a.provider.Run(ctx, systemPrompt(a.cfg.Language), user, a.tools, a.cfg.MaxTurns, exec)
+	usage, err := prov.Run(ctx, systemPrompt(cfg.Language), user, a.tools, cfg.MaxTurns, exec)
 	f.Usage = usage
 	f.DurationMs = time.Since(start).Milliseconds()
 	if err != nil && !submitted {
@@ -253,6 +270,10 @@ func (a *Analyst) run(parent context.Context, id string, t task) {
 	a.saveLocked()
 	a.mu.Unlock()
 	a.log.Info("analysis finished", "id", id, "mode", t.Mode, "status", f.Status, "turns", usage.Turns, "ms", f.DurationMs)
+	if a.OnFinding != nil && f.Status == "ok" {
+		c := *f
+		go a.OnFinding(&c)
+	}
 }
 
 func (a *Analyst) trace(mu *sync.Mutex, f *Finding, turn int, name string, input json.RawMessage, out string, isErr bool, t0 time.Time) {

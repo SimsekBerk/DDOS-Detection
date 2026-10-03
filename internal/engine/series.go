@@ -23,6 +23,7 @@ type rate struct {
 	BPS, PPS, FPS float64
 	Samples       float64
 	AvgPktSize    float64
+	ActiveSeconds int // buckets in the window that received traffic
 }
 
 type seriesKey struct {
@@ -37,6 +38,7 @@ type series struct {
 	stamp [ringSize]int64
 
 	trackUniques bool
+	warm         bool // near a threshold: track unique peers
 	uniques      map[netip.Addr]int64
 	trackDests   bool
 	dests        map[netip.Addr]int64
@@ -57,10 +59,12 @@ type series struct {
 	accMinute int64
 
 	// trigger state
+	devSecs   int // consecutive seconds with a signal-worthy deviation
 	over      int
 	under     int64
 	active    bool
 	incident  string
+	coveredBy string // incident explaining this (suppressed) generic/wider vector
 	lastRate  rate
 	lastRatio float64
 }
@@ -104,7 +108,7 @@ func (s *series) add(r *flow.Record, now int64, maxSpread int64, peer, target ne
 		}
 	}
 	s.lastSeen = now
-	if s.trackUniques && peer.IsValid() {
+	if s.trackUniques && s.warm && peer.IsValid() {
 		if s.uniques == nil {
 			s.uniques = make(map[netip.Addr]int64)
 		}
@@ -112,7 +116,7 @@ func (s *series) add(r *flow.Record, now int64, maxSpread int64, peer, target ne
 			s.uniques[peer] = now
 		}
 	}
-	if s.trackDests && target.IsValid() {
+	if s.trackDests && s.warm && target.IsValid() {
 		if s.dests == nil {
 			s.dests = make(map[netip.Addr]int64)
 		}
@@ -125,6 +129,7 @@ func (s *series) add(r *flow.Record, now int64, maxSpread int64, peer, target ne
 // window returns the rate over the complete seconds [now-w, now-1].
 func (s *series) window(now int64, w int64) rate {
 	var sum bucket
+	active := 0
 	for t := now - w; t < now; t++ {
 		i := t % ringSize
 		if s.stamp[i] == t {
@@ -133,9 +138,12 @@ func (s *series) window(now int64, w int64) rate {
 			sum.packets += b.packets
 			sum.flows += b.flows
 			sum.samples += b.samples
+			if b.packets > 0 {
+				active++
+			}
 		}
 	}
-	r := rate{BPS: sum.bytes * 8 / float64(w), PPS: sum.packets / float64(w), FPS: sum.flows / float64(w), Samples: sum.samples}
+	r := rate{BPS: sum.bytes * 8 / float64(w), PPS: sum.packets / float64(w), FPS: sum.flows / float64(w), Samples: sum.samples, ActiveSeconds: active}
 	if sum.packets > 0 {
 		r.AvgPktSize = sum.bytes / sum.packets
 	}

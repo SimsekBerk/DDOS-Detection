@@ -15,7 +15,7 @@ ddosd, `collector.listen` altındaki tüm UDP portlarında NetFlow v5/v9, IPFIX 
 | Yön | **Ingress** (internetten gelen) arayüzlerde | Inbound saldırılar; outbound için müşteri yönlü ingress |
 | Template timeout | 60 sn | Collector yeniden başladığında şablonsuz veri süresini kısaltır |
 | Örnekleme oranı bildirimi | Flow içinde ya da options template ile gönderin | Gönderilmiyorsa `exporters[].sampling_rate` ile zorlayın; yanlış oran tüm eşikleri kaydırır |
-| Sunucu | `sysctl -w net.core.rmem_max=33554432`; UDP portlarını firewall'da açın | Ani yüklerde UDP kaybını önler (Telemetri Kaynakları → "Kayıp") |
+| Sunucu | `sysctl -w net.core.rmem_max=33554432`; UDP portlarını firewall'da açın | Ani yüklerde UDP kaybını önler (Ayarlar → Telemetri; `ddosd_exporter_lost_total`) |
 
 Şablonlarda şu alanlar bulunmalı:
 - Kaynak ve hedef IP, protokol, kaynak ve hedef port

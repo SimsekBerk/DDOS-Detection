@@ -84,6 +84,9 @@ type Manager struct {
 	eng    *engine.Engine
 	driver Driver
 	log    *slog.Logger
+	// OnEvent is called (in a goroutine) on lifecycle changes:
+	// pending, active, withdrawn, expired, rejected, failed.
+	OnEvent func(event string, m *Mitigation)
 
 	mu   sync.Mutex
 	byID map[string]*Mitigation
@@ -92,14 +95,7 @@ type Manager struct {
 
 func New(cfg *config.Config, eng *engine.Engine, log *slog.Logger) (*Manager, error) {
 	m := &Manager{cfg: cfg.Mitigation, eng: eng, log: log, byID: map[string]*Mitigation{}}
-	switch cfg.Mitigation.Driver {
-	case "exabgp":
-		m.driver = &exabgpDriver{path: cfg.Mitigation.ExaBGP.CommandFile}
-	case "webhook":
-		m.driver = &webhookDriver{url: cfg.Mitigation.Webhook.URL, secret: cfg.Mitigation.Webhook.Secret}
-	default:
-		m.driver = &dryRunDriver{log: log}
-	}
+	m.driver = newDriver(cfg.Mitigation, log)
 	var dump struct {
 		Seq         int           `json:"seq"`
 		Mitigations []*Mitigation `json:"mitigations"`
@@ -121,11 +117,49 @@ func New(cfg *config.Config, eng *engine.Engine, log *slog.Logger) (*Manager, er
 	return m, nil
 }
 
+func newDriver(c config.MitigationConfig, log *slog.Logger) Driver {
+	switch c.Driver {
+	case "exabgp":
+		return &exabgpDriver{path: c.ExaBGP.CommandFile}
+	case "webhook":
+		return &webhookDriver{url: c.Webhook.URL, secret: c.Webhook.Secret}
+	}
+	return &dryRunDriver{log: log}
+}
+
+// UpdateConfig applies mitigation policy changes at runtime. Active rules
+// stay announced; a driver change applies to future announcements and
+// withdrawals.
+func (m *Manager) UpdateConfig(cfg *config.Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old := m.cfg
+	m.cfg = cfg.Mitigation
+	if old.Driver != m.cfg.Driver || old.ExaBGP != m.cfg.ExaBGP || old.Webhook != m.cfg.Webhook {
+		m.driver = newDriver(m.cfg, m.log)
+	}
+}
+
+func (m *Manager) emit(event string, x *Mitigation) {
+	if m.OnEvent != nil {
+		c := x.copy()
+		go m.OnEvent(event, c)
+	}
+}
+
 // DriverName returns the active driver.
-func (m *Manager) DriverName() string { return m.driver.Name() }
+func (m *Manager) DriverName() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.driver.Name()
+}
 
 // Mode returns the configured mode.
-func (m *Manager) Mode() string { return m.cfg.Mode }
+func (m *Manager) Mode() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.Mode
+}
 
 func (m *Manager) nextID() string {
 	m.seq++
@@ -136,7 +170,10 @@ func (m *Manager) nextID() string {
 
 // VectorStarted implements engine.Hooks.
 func (m *Manager) VectorStarted(inc *engine.Incident, ruleID string) {
-	if m.cfg.Mode == "off" {
+	m.mu.Lock()
+	cfg := m.cfg
+	m.mu.Unlock()
+	if cfg.Mode == "off" {
 		return
 	}
 	set := m.eng.Rules()
@@ -177,21 +214,21 @@ func (m *Manager) VectorStarted(inc *engine.Incident, ruleID string) {
 	case "rtbh":
 		if inc.Scope == "host" {
 			x := base("rtbh")
-			x.RTBH = m.rtbhFor(inc.Target)
+			x.RTBH = m.rtbhFor(cfg, inc.Target)
 			reqs = append(reqs, x)
 		}
 	}
 	// RTBH escalation: only for single hosts and only as a manual decision.
 	if c.Mitigation.RTBHEscalation > 0 && inc.Scope == "host" && inc.Direction == "inbound" &&
-		inc.LinkCapacity > 0 && inc.PeakBPS >= c.Mitigation.RTBHEscalation*inc.LinkCapacity && m.cfg.AllowRTBH {
+		inc.LinkCapacity > 0 && inc.PeakBPS >= c.Mitigation.RTBHEscalation*inc.LinkCapacity && cfg.AllowRTBH {
 		x := base("rtbh")
-		x.RTBH = m.rtbhFor(inc.Target)
+		x.RTBH = m.rtbhFor(cfg, inc.Target)
 		x.Reason = fmt.Sprintf("Eskalasyon: tepe %.2f Gbps, bağlantı kapasitesinin %%%.0f'ini aştı", inc.PeakBPS/1e9, 100*c.Mitigation.RTBHEscalation)
 		x.Note = "RTBH hedefi tamamen erişilemez kılar; yalnızca bağlantının tamamı tehlikedeyse onaylayın."
 		reqs = append(reqs, x)
 	}
 	for _, x := range reqs {
-		m.submit(x, m.cfg.Mode == "auto" && x.Kind != "rtbh")
+		m.submit(x, cfg.Mode == "auto" && x.Kind != "rtbh")
 	}
 }
 
@@ -209,19 +246,26 @@ func (m *Manager) IncidentEnded(inc *engine.Incident) {
 			x.WithdrawAt = now + int64(m.cfg.WithdrawAfter.Seconds())
 			x.History = append(x.History, Event{T: now, Status: x.Status, Actor: "system", Msg: "olay bitti; geri çekme zamanlandı"})
 		case "pending":
-			x.log("expired", "system", "olay onaydan önce bitti")
+			m.setStatus(x, "expired", "system", "olay onaydan önce bitti")
 			x.EndedAt = now
 		}
 	}
 	m.saveLocked()
 }
 
-func (m *Manager) rtbhFor(target string) *RTBH {
+// setStatus records a lifecycle change and emits an event.
+func (m *Manager) setStatus(x *Mitigation, status, actor, msg string) {
+	x.log(status, actor, msg)
+	m.emit(status, x)
+}
+
+// rtbhFor builds an RTBH announcement.
+func (m *Manager) rtbhFor(cfg config.MitigationConfig, target string) *RTBH {
 	a, err := netip.ParseAddr(target)
 	if err != nil {
 		return nil
 	}
-	nh := m.cfg.ExaBGP.RTBHNextHop
+	nh := cfg.ExaBGP.RTBHNextHop
 	if nh == "" {
 		if a.Is4() {
 			nh = "192.0.2.1"
@@ -229,7 +273,7 @@ func (m *Manager) rtbhFor(target string) *RTBH {
 			nh = "100::1"
 		}
 	}
-	return &RTBH{Prefix: netip.PrefixFrom(a, a.BitLen()).String(), NextHop: nh, Community: m.cfg.ExaBGP.RTBHCommunity}
+	return &RTBH{Prefix: netip.PrefixFrom(a, a.BitLen()).String(), NextHop: nh, Community: cfg.ExaBGP.RTBHCommunity}
 }
 
 // buildFlowSpec derives the narrowest FlowSpec rule from the rule match and evidence.
@@ -407,14 +451,14 @@ func (m *Manager) submit(x *Mitigation, apply bool) (*Mitigation, error) {
 	x.Rendered = x.render()
 	if err != nil {
 		x.Error = err.Error()
-		x.log("rejected", "guardrail", err.Error())
+		m.setStatus(x, "rejected", "guardrail", err.Error())
 		m.byID[x.ID] = x
 		m.attach(x)
 		m.saveLocked()
 		m.log.Warn("mitigation rejected by guardrail", "id", x.ID, "err", err)
 		return x, err
 	}
-	x.log("pending", x.Source, "onay bekliyor")
+	m.setStatus(x, "pending", x.Source, "onay bekliyor")
 	m.byID[x.ID] = x
 	m.attach(x)
 	if apply {
@@ -433,24 +477,24 @@ func (m *Manager) attach(x *Mitigation) {
 func (m *Manager) activateLocked(x *Mitigation, actor string) {
 	if err := m.driver.Announce(x); err != nil {
 		x.Error = err.Error()
-		x.log("failed", actor, err.Error())
+		m.setStatus(x, "failed", actor, err.Error())
 		return
 	}
 	now := time.Now().Unix()
 	x.ActivatedAt = now
 	x.ExpiresAt = now + int64(m.cfg.DefaultTTL.Seconds())
-	x.log("active", actor, "sürücü: "+m.driver.Name())
+	m.setStatus(x, "active", actor, "sürücü: "+m.driver.Name())
 	m.log.Info("mitigation activated", "id", x.ID, "kind", x.Kind, "target", x.Target, "driver", m.driver.Name())
 }
 
 func (m *Manager) withdrawLocked(x *Mitigation, actor, msg, status string) {
 	if err := m.driver.Withdraw(x); err != nil {
 		x.Error = err.Error()
-		x.log("failed", actor, "geri çekme hatası: "+err.Error())
+		m.setStatus(x, "failed", actor, "geri çekme hatası: "+err.Error())
 		return
 	}
 	x.EndedAt = time.Now().Unix()
-	x.log(status, actor, msg)
+	m.setStatus(x, status, actor, msg)
 	m.log.Info("mitigation withdrawn", "id", x.ID, "reason", msg)
 }
 
@@ -484,7 +528,10 @@ func (m *Manager) Create(req Request, actor string) (*Mitigation, error) {
 			}
 			p = netip.PrefixFrom(a, a.BitLen())
 		}
-		x.RTBH = m.rtbhFor(p.Addr().String())
+		m.mu.Lock()
+		cfg := m.cfg
+		m.mu.Unlock()
+		x.RTBH = m.rtbhFor(cfg, p.Addr().String())
 		x.Target = p.Addr().String()
 	case "scrub":
 		x.Target = req.RTBHPrefix
@@ -525,7 +572,7 @@ func (m *Manager) Reject(id, actor, reason string) (*Mitigation, error) {
 		return nil, fmt.Errorf("durum %s; yalnızca pending reddedilebilir", x.Status)
 	}
 	x.EndedAt = time.Now().Unix()
-	x.log("rejected", actor, reason)
+	m.setStatus(x, "rejected", actor, reason)
 	m.saveLocked()
 	return x.copy(), nil
 }

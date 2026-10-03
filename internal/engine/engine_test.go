@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,10 +13,28 @@ import (
 	"github.com/SimsekBerk/DDOS-Detection/internal/flowstore"
 )
 
-type hookRec struct{ started, ended []string }
+type hookRec struct {
+	mu             sync.Mutex
+	started, ended []string
+}
 
-func (h *hookRec) VectorStarted(inc *Incident, rule string) { h.started = append(h.started, rule) }
-func (h *hookRec) IncidentEnded(inc *Incident)              { h.ended = append(h.ended, inc.ID) }
+func (h *hookRec) VectorStarted(inc *Incident, rule string) {
+	h.mu.Lock()
+	h.started = append(h.started, rule)
+	h.mu.Unlock()
+}
+
+func (h *hookRec) IncidentEnded(inc *Incident) {
+	h.mu.Lock()
+	h.ended = append(h.ended, inc.ID)
+	h.mu.Unlock()
+}
+
+func (h *hookRec) counts() (int, int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.started), len(h.ended)
+}
 
 func testEngine(t *testing.T) (*Engine, *int64) {
 	t.Helper()
@@ -37,6 +56,8 @@ func testEngine(t *testing.T) (*Engine, *int64) {
 	cfg.Engine.SignalMinZ = 4
 	cfg.Engine.SignalMinPPS = 1000
 	cfg.Engine.SignalMinBPS = 10e6
+	cfg.Engine.SignalMinSeconds = 3
+	cfg.Engine.MaxSeries = 250_000
 	cfg.Collector.QueueSize = 16
 	e, err := New(cfg, flowstore.New(100000), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -86,7 +107,7 @@ func TestDetectsAndEndsDNSAmplification(t *testing.T) {
 		t.Fatalf("amp_dns vector missing: %+v", found)
 	}
 	time.Sleep(200 * time.Millisecond) // evidence goroutine
-	if len(h.started) == 0 {
+	if st, _ := h.counts(); st == 0 {
 		t.Error("VectorStarted hook not called")
 	}
 	if got := e.incidents.Get(inc.ID); got.Evidence == nil || got.Evidence.Breakdown.Records == 0 {
@@ -101,8 +122,8 @@ func TestDetectsAndEndsDNSAmplification(t *testing.T) {
 		t.Fatalf("incident should have ended, %d still active", a)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if len(h.ended) != 1 {
-		t.Errorf("IncidentEnded called %d times", len(h.ended))
+	if _, en := h.counts(); en != 1 {
+		t.Errorf("IncidentEnded called %d times", en)
 	}
 }
 
@@ -211,5 +232,71 @@ func TestBaselineDeviationSignal(t *testing.T) {
 	}
 	if !ok {
 		t.Fatalf("expected a baseline deviation signal, got %+v", e.signals.List(false, 0, 0))
+	}
+}
+
+// Two different carpet attacks on one /24 (UDP amplification + TCP SYN) must
+// both be reported: an active SYN vector does not explain UDP traffic, so it
+// must not suppress the amplification vector (regression).
+func TestConcurrentCarpetVectorsBothReported(t *testing.T) {
+	e, now := testEngine(t)
+	for i := 0; i < 12; i++ {
+		var batch []flow.Record
+		for h := 1; h < 255; h++ {
+			dst := netip.AddrFrom4([4]byte{198, 51, 100, byte(h)})
+			for s := 0; s < 2; s++ {
+				src := netip.AddrFrom4([4]byte{91, 2, byte(h), byte(s)})
+				batch = append(batch, flow.Record{ReceivedUnix: *now, Src: src, Dst: dst, Protocol: flow.ProtoUDP, SrcPort: 123, DstPort: 5000,
+					Packets: 400, Bytes: 400 * 468, SamplingRate: 1, Source: flow.SourceIPFIX})
+				bot := netip.AddrFrom4([4]byte{100, 64, byte(h), byte(s)})
+				batch = append(batch, flow.Record{ReceivedUnix: *now, Src: bot, Dst: dst, Protocol: flow.ProtoTCP, TCPFlags: flow.TCPSyn, SrcPort: 40000, DstPort: 443,
+					Packets: 1200, Bytes: 1200 * 60, SamplingRate: 1, Source: flow.SourceIPFIX})
+			}
+		}
+		e.ingest(batch)
+		*now++
+		e.evaluate(*now)
+	}
+	got := map[string]bool{}
+	for _, inc := range e.incidents.List("active", 0) {
+		if inc.Target != "198.51.100.0/24" {
+			continue
+		}
+		for _, v := range inc.Vectors {
+			got[v.RuleID] = true
+		}
+	}
+	if !got["carpet_amplification"] || !got["carpet_syn"] {
+		t.Fatalf("expected both carpet vectors on the /24, got %v", got)
+	}
+}
+
+// Right after start everything is unlearned, so near-threshold signals need
+// a high ratio; after warm-up, traffic to a host that never received it is
+// new and a sub-threshold attack is reported to the analyst.
+func TestNearThresholdSignalAfterWarmup(t *testing.T) {
+	e, now := testEngine(t) // baseline_learn 30s, near_miss_ratio 0.5
+	near := func(victim netip.Addr, secs int) bool {
+		for i := 0; i < secs; i++ {
+			e.ingest(dnsAmp(victim, 12000, 40, *now)) // 60% of the 20kpps threshold
+			*now++
+			e.evaluate(*now)
+		}
+		for _, s := range e.signals.List(false, 0, 0) {
+			if s.RuleID == "amp_dns" && s.Kind == "near_threshold" && s.Target == victim.String() {
+				return true
+			}
+		}
+		return false
+	}
+	if near(netip.MustParseAddr("198.51.100.20"), 8) {
+		t.Fatal("near-threshold signal during the initial learning period")
+	}
+	for i := 0; i < 60; i++ { // quiet warm-up
+		*now++
+		e.evaluate(*now)
+	}
+	if !near(netip.MustParseAddr("198.51.100.21"), 8) {
+		t.Fatal("expected near-threshold signal for new traffic after warm-up")
 	}
 }

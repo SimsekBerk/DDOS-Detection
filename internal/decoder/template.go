@@ -57,9 +57,10 @@ func (d *Decoder) parseNF9Templates(exporter netip.Addr, domain uint32, b []byte
 		}
 		b = b[count*4:]
 		d.mu.Lock()
-		d.nf9[tmplKey{exporter, domain, id}] = t
+		if d.storeTemplate(d.nf9, tmplKey{exporter, domain, id}, t) {
+			n++
+		}
 		d.mu.Unlock()
-		n++
 	}
 	return n
 }
@@ -80,9 +81,10 @@ func (d *Decoder) parseNF9OptionsTemplates(exporter netip.Addr, domain uint32, b
 		}
 		b = b[scopeLen+optLen:]
 		d.mu.Lock()
-		d.nf9[tmplKey{exporter, domain, id}] = t
+		if d.storeTemplate(d.nf9, tmplKey{exporter, domain, id}, t) {
+			n++
+		}
 		d.mu.Unlock()
-		n++
 	}
 	return n
 }
@@ -145,7 +147,10 @@ func (d *Decoder) parseIPFIXTemplates(exporter netip.Addr, domain uint32, b []by
 		key := tmplKey{exporter, domain, id}
 		if count == 0 { // template withdrawal
 			d.mu.Lock()
-			delete(d.ipfix, key)
+			if _, ok := d.ipfix[key]; ok {
+				delete(d.ipfix, key)
+				d.perExp[exporter]--
+			}
 			d.mu.Unlock()
 			continue
 		}
@@ -173,9 +178,10 @@ func (d *Decoder) parseIPFIXTemplates(exporter netip.Addr, domain uint32, b []by
 			break
 		}
 		d.mu.Lock()
-		d.ipfix[key] = t
+		if d.storeTemplate(d.ipfix, key, t) {
+			n++
+		}
 		d.mu.Unlock()
-		n++
 	}
 	return n
 }

@@ -1,70 +1,73 @@
-import { useEffect, useState } from "react";
-import { api, Breakdown, FlowFilter, SampleFlow, TopResult } from "../api";
-import { Bars, Card, Empty, ErrorLine, KV, Tabs } from "../components/ui";
-import { bps, num, pct, pps } from "../lib";
+import { FormEvent, useEffect, useState } from "react";
+import { api, Breakdown, FlowFilter, SampleFlow, TargetRuleState, TopResult } from "../api";
+import { ThresholdLine } from "../components/charts";
+import { Bars, Card, Empty, ErrorLine, Field, Kpi, Meter, PageHead, Seg } from "../components/ui";
+import { bps, go, num, pct, pps, usePoll } from "../lib";
 import { SampleTable } from "./IncidentDetail";
 
-const dims = [
+const dims: [string, string][] = [
   ["src_ip", "Kaynak IP"],
   ["dst_ip", "Hedef IP"],
   ["src_port", "Kaynak port"],
   ["dst_port", "Hedef port"],
   ["protocol", "Protokol"],
-  ["tcp_flags", "TCP flag"],
+  ["src_net", "Kaynak ağ"],
   ["packet_size", "Paket boyu"],
-  ["src_net", "Kaynak ağ (/24)"],
-  ["dst_net", "Hedef ağ (/24)"],
+  ["tcp_flags", "TCP flag"],
   ["exporter", "Exporter"],
-  ["in_if", "Giriş arayüzü"],
-  ["src_as", "Kaynak AS"],
-  ["icmp_type", "ICMP tipi"],
-  ["direction", "Yön"],
   ["object", "Nesne"],
-  ["fragment", "Fragment"],
 ];
 
-function initialFilter(): FlowFilter {
-  const q = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
-  const f: FlowFilter = { seconds: 60 };
-  if (q.get("dst")) f.dst = q.get("dst")!;
-  if (q.get("src")) f.src = q.get("src")!;
-  return f;
+export default function ExplorerPage({ target }: { target?: string }) {
+  const [tab, setTab] = useState<"flows" | "target">(target ? "target" : "flows");
+  useEffect(() => {
+    if (target) setTab("target");
+  }, [target]);
+  return (
+    <div className="page">
+      <PageHead title="Trafik gezgini" desc="Son flow kayıtları üzerinde sorgu ve bir IP adresi için kural bazında durum analizi." />
+      <Seg
+        value={tab}
+        onChange={(t) => {
+          setTab(t);
+          if (t === "flows") go("/explorer");
+        }}
+        options={[
+          { id: "flows", label: "Flow sorgusu" },
+          { id: "target", label: "Hedef analizi" },
+        ]}
+      />
+      {tab === "flows" ? <FlowQuery /> : <TargetAnalysis ip={target} />}
+    </div>
+  );
 }
 
-export default function ExplorerPage() {
-  const [f, setF] = useState<FlowFilter>(initialFilter);
-  const [dim, setDim] = useState("src_ip");
-  const [metric, setMetric] = useState<"bps" | "pps" | "fps">("bps");
-  const [tab, setTab] = useState<"top" | "breakdown" | "samples">("top");
+function FlowQuery() {
+  const [f, setF] = useState<FlowFilter>({ seconds: 60, direction: "inbound" });
+  const [dim, setDim] = useState("dst_ip");
+  const [view, setView] = useState<"top" | "samples">("top");
   const [top, setTop] = useState<TopResult | null>(null);
   const [bd, setBd] = useState<Breakdown | null>(null);
   const [samples, setSamples] = useState<SampleFlow[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const clean = (x: FlowFilter): FlowFilter => {
-    const o: Record<string, unknown> = {};
-    Object.entries(x).forEach(([k, v]) => {
-      if (v !== "" && v !== undefined && v !== null && !(typeof v === "number" && isNaN(v))) o[k] = v;
-    });
-    return o as FlowFilter;
-  };
-
-  const query = async () => {
+  const query = async (e?: FormEvent) => {
+    e?.preventDefault();
     setBusy(true);
     setErr(null);
+    const filter = Object.fromEntries(Object.entries(f).filter(([, v]) => v !== "" && v !== undefined && !(typeof v === "number" && isNaN(v))));
     try {
-      const filter = clean(f);
       const [t, b, s] = await Promise.all([
-        api.post<TopResult>("/flows/top", { filter, dimension: dim, metric, limit: 25 }),
+        api.post<TopResult>("/flows/top", { filter, dimension: dim, metric: "bps", limit: 20 }),
         api.post<Breakdown>("/flows/breakdown", { filter }),
         api.post<SampleFlow[]>("/flows/samples", { filter, limit: 100 }),
       ]);
       setTop(t);
       setBd(b);
       setSamples(s);
-    } catch (e) {
-      setErr((e as Error).message);
+    } catch (e2) {
+      setErr((e2 as Error).message);
     } finally {
       setBusy(false);
     }
@@ -72,66 +75,51 @@ export default function ExplorerPage() {
   useEffect(() => {
     void query();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dim, metric]);
-
+  }, [dim]);
   const set = (k: keyof FlowFilter, numeric = false) => (e: { target: { value: string } }) =>
     setF({ ...f, [k]: e.target.value === "" ? undefined : numeric ? Number(e.target.value) : e.target.value });
 
   return (
-    <div className="page">
-      <div className="page-h">
-        <div>
-          <h1>Flow Explorer</h1>
-          <div className="muted">Bellekteki son flow kayıtları üzerinde ad-hoc sorgu (örnekleme ile ölçeklenmiş). Üretimde bu katman ClickHouse ile değiştirilir.</div>
-        </div>
-      </div>
-      <Card title="Filtre">
-        <form
-          className="form filters"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void query();
-          }}
-        >
-          <label>
-            Pencere (sn)
-            <input type="number" value={f.seconds ?? 60} onChange={set("seconds", true)} />
-          </label>
-          <label>
-            Yön
+    <>
+      <Card>
+        <form className="form" onSubmit={query}>
+          <Field label="Hedef IP / prefix">
+            <input value={f.dst ?? ""} onChange={set("dst")} placeholder="198.51.100.0/24" />
+          </Field>
+          <Field label="Kaynak IP / prefix">
+            <input value={f.src ?? ""} onChange={set("src")} />
+          </Field>
+          <Field label="Protokol">
+            <select value={f.protocol ?? ""} onChange={set("protocol")}>
+              <option value="">hepsi</option>
+              <option>tcp</option>
+              <option>udp</option>
+              <option>icmp</option>
+              <option>gre</option>
+            </select>
+          </Field>
+          <Field label="Yön">
             <select value={f.direction ?? ""} onChange={set("direction")}>
               <option value="">hepsi</option>
-              <option value="inbound">inbound</option>
-              <option value="outbound">outbound</option>
-              <option value="other">other</option>
+              <option value="inbound">gelen</option>
+              <option value="outbound">giden</option>
             </select>
-          </label>
-          <label>
-            Kaynak IP/prefix
-            <input value={f.src ?? ""} onChange={set("src")} />
-          </label>
-          <label>
-            Hedef IP/prefix
-            <input value={f.dst ?? ""} onChange={set("dst")} />
-          </label>
-          <label>
-            Protokol
-            <input value={f.protocol ?? ""} onChange={set("protocol")} placeholder="udp, tcp, 47…" />
-          </label>
-          <label>
-            Kaynak port
+          </Field>
+          <Field label="Kaynak port">
             <input type="number" value={f.src_port ?? ""} onChange={set("src_port", true)} />
-          </label>
-          <label>
-            Hedef port
+          </Field>
+          <Field label="Hedef port">
             <input type="number" value={f.dst_port ?? ""} onChange={set("dst_port", true)} />
-          </label>
-          <label>
-            TCP flag (tam)
-            <input value={f.tcp_flags ?? ""} onChange={set("tcp_flags")} placeholder="SYN veya SYN|ACK" />
-          </label>
-          <label>
-            Grupla
+          </Field>
+          <Field label="Zaman penceresi">
+            <select value={String(f.seconds ?? 60)} onChange={set("seconds", true)}>
+              <option value="30">30 sn</option>
+              <option value="60">1 dk</option>
+              <option value="300">5 dk</option>
+              <option value="900">15 dk</option>
+            </select>
+          </Field>
+          <Field label="Gruplama">
             <select value={dim} onChange={(e) => setDim(e.target.value)}>
               {dims.map(([k, l]) => (
                 <option key={k} value={k}>
@@ -139,122 +127,140 @@ export default function ExplorerPage() {
                 </option>
               ))}
             </select>
-          </label>
-          <label>
-            Metrik
-            <select value={metric} onChange={(e) => setMetric(e.target.value as "bps")}>
-              <option value="bps">bps</option>
-              <option value="pps">pps</option>
-              <option value="fps">fps</option>
-            </select>
-          </label>
-          <div className="row end full">
-            <button className="btn" type="button" onClick={() => setF({ seconds: 60 })}>
-              Temizle
-            </button>
-            <button className="btn primary" disabled={busy}>
-              {busy ? "Sorgulanıyor…" : "Sorgula"}
-            </button>
+          </Field>
+          <div className="field full">
+            <div className="row end">
+              <button type="button" className="btn" onClick={() => setF({ seconds: 60 })}>
+                Temizle
+              </button>
+              <button className="btn primary" disabled={busy}>
+                {busy ? "Sorgulanıyor…" : "Sorgula"}
+              </button>
+            </div>
           </div>
         </form>
       </Card>
       <ErrorLine error={err} />
       {bd && (
-        <div className="stats">
-          <div className="stat">
-            <div className="stat-l">Toplam</div>
-            <div className="stat-v">{bps(bd.total_bps)}</div>
-            <div className="stat-s">{pps(bd.total_pps)}</div>
-          </div>
-          <div className="stat">
-            <div className="stat-l">Kayıt</div>
-            <div className="stat-v">{num(bd.records)}</div>
-            <div className="stat-s">{bd.seconds} sn</div>
-          </div>
-          <div className="stat">
-            <div className="stat-l">Benzersiz kaynak / hedef</div>
-            <div className="stat-v">
-              {num(bd.unique_src)} / {num(bd.unique_dst)}
-            </div>
-          </div>
-          <div className="stat">
-            <div className="stat-l">Ort. paket</div>
-            <div className="stat-v">{num(bd.avg_packet_size)} B</div>
-            <div className="stat-s">fragment {pct(bd.fragment_share)}</div>
-          </div>
+        <div className="kpis">
+          <Kpi label="Toplam" value={bps(bd.total_bps)} sub={pps(bd.total_pps)} />
+          <Kpi label="Benzersiz kaynak / hedef" value={`${num(bd.unique_src)} / ${num(bd.unique_dst)}`} />
+          <Kpi label="Ortalama paket" value={num(bd.avg_packet_size) + " B"} sub={"fragment " + pct(bd.fragment_share)} />
+          <Kpi label="Kayıt" value={num(bd.records)} sub={"örnekleme " + bd.sampling_rates.map((r) => "1:" + r).join(", ")} />
         </div>
       )}
-      <Card pad={false} title={<Tabs value={tab} onChange={setTab} tabs={[{ id: "top", label: "Top-N" }, { id: "breakdown", label: "Kırılım" }, { id: "samples", label: `Ham kayıtlar (${samples.length})` }]} />}>
-        <div className="card-b">
-          {tab === "top" &&
-            (top && top.rows.length ? (
-              <>
-                <Bars rows={top.rows} metric={metric === "pps" ? "pps" : "bps"} limit={25} />
-                <table className="tbl small" style={{ marginTop: 12 }}>
-                  <thead>
-                    <tr>
-                      <th>{dims.find((d) => d[0] === dim)?.[1]}</th>
-                      <th className="r">bps</th>
-                      <th className="r">pps</th>
-                      <th className="r">fps</th>
-                      <th className="r">Pay</th>
-                      <th className="r">Kayıt</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {top.rows.map((r) => (
-                      <tr key={r.key}>
-                        <td className="mono">{r.key}</td>
-                        <td className="r mono">{bps(r.bps)}</td>
-                        <td className="r mono">{pps(r.pps)}</td>
-                        <td className="r mono">{r.fps.toFixed(1)}</td>
-                        <td className="r mono">{pct(r.share, 1)}</td>
-                        <td className="r mono">{num(r.records)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>
-            ) : (
-              <Empty>Sonuç yok</Empty>
-            ))}
-          {tab === "breakdown" &&
-            (bd ? (
-              <div className="grid g-3">
-                <div>
-                  <h4>Protokol</h4>
-                  <Bars rows={bd.protocols} />
-                </div>
-                <div>
-                  <h4>Paket boyu</h4>
-                  <Bars rows={bd.packet_sizes} metric="pps" />
-                </div>
-                <div>
-                  <h4>TCP flag</h4>
-                  <Bars rows={bd.tcp_flags} metric="pps" />
-                </div>
-                <div>
-                  <h4>Kaynak port</h4>
-                  <Bars rows={bd.top_src_ports} />
-                </div>
-                <div>
-                  <h4>Hedef port</h4>
-                  <Bars rows={bd.top_dst_ports} />
-                </div>
-                <div>
-                  <h4>Kaynak ağlar</h4>
-                  <Bars rows={bd.top_src_nets} />
-                </div>
-                <div>
-                  <KV items={[["Örnekleme oranları", bd.sampling_rates.map((r) => "1:" + r).join(", ")], ["Exporter", bd.exporters.map((e) => e.key).join(", ")]]} />
-                </div>
-              </div>
-            ) : (
-              <Empty>-</Empty>
-            ))}
-          {tab === "samples" && <SampleTable samples={samples} />}
+      <Card
+        flush
+        title={<Seg value={view} onChange={setView} options={[{ id: "top", label: dims.find((d) => d[0] === dim)?.[1] ?? "Top" }, { id: "samples", label: `Kayıtlar (${samples.length})` }]} />}
+      >
+        <div className="card-body">{view === "top" ? <Bars rows={top?.rows} limit={20} /> : <SampleTable samples={samples} />}</div>
+      </Card>
+    </>
+  );
+}
+
+function TargetAnalysis({ ip }: { ip?: string }) {
+  const [input, setInput] = useState(ip ?? "");
+  useEffect(() => setInput(ip ?? ""), [ip]);
+  return (
+    <>
+      <Card>
+        <form
+          className="row"
+          onSubmit={(e) => {
+            e.preventDefault();
+            go("/explorer/target/" + input.trim());
+          }}
+        >
+          <input style={{ flex: 1, minWidth: 200 }} value={input} onChange={(e) => setInput(e.target.value)} placeholder="IP adresi, ör. 198.51.100.10" />
+          <button className="btn primary">Analiz et</button>
+        </form>
+        <p className="small muted">Bir IP için her kuralın anlık hızını, efektif eşiğini, normal seviyesini (baseline) ve koşul durumunu gösterir: “dedektör neden tetiklenmedi?” sorusunun cevabı.</p>
+      </Card>
+      {ip && <TargetState ip={ip} />}
+    </>
+  );
+}
+
+function TargetState({ ip }: { ip: string }) {
+  const st = usePoll(() => api.get<TargetRuleState[] | null>(`/target?ip=${encodeURIComponent(ip)}`), 2500, [ip]);
+  const [sel, setSel] = useState<string | null>(null);
+  const [unit, setUnit] = useState<"pps" | "bps">("pps");
+  const rows = (st.data ?? []).slice().sort((a, b) => b.ratio - a.ratio);
+  const cur = rows.find((r) => r.rule_id + r.target === sel) ?? rows[0];
+  if (st.error) return <ErrorLine error={st.error} />;
+  if (!st.data) return <Empty>Yükleniyor…</Empty>;
+  if (rows.length === 0) return <Empty>{ip} için son pencerede eşleşen trafik yok.</Empty>;
+  return (
+    <div className="grid cols-main">
+      <Card title={`${ip} — kural durumu`} flush>
+        <div className="tbl-wrap">
+          <table className="tbl">
+            <thead>
+              <tr>
+                <th>Kural</th>
+                <th className="num">Hız</th>
+                <th>Eşiğe oran</th>
+                <th>Durum</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.rule_id + r.target} className="row-link" onClick={() => setSel(r.rule_id + r.target)} style={cur === r ? { background: "var(--surface-2)" } : undefined}>
+                  <td style={{ maxWidth: 260 }}>
+                    <div className="cell-main trunc">{r.rule_name}</div>
+                    <div className="cell-sub trunc">
+                      {r.scope === "host" ? "tek hedef" : r.scope === "prefix" ? "blok " + r.target : "nesne"}
+                    </div>
+                  </td>
+                  <td className="num">
+                    {pps(r.pps)}
+                    <div className="cell-sub">{bps(r.bps)}</div>
+                  </td>
+                  <td style={{ width: 130 }}>
+                    <Meter value={r.ratio} />
+                    <div className="cell-sub num">{r.ratio.toFixed(2)}×</div>
+                  </td>
+                  <td className="small">
+                    {r.active ? (
+                      <a href={"#/incidents/" + r.incident}>saldırı</a>
+                    ) : r.conditions !== "ok" && r.ratio >= 1 ? (
+                      <span title={r.conditions}>koşul sağlanmadı</span>
+                    ) : r.consecutive_over > 0 ? (
+                      `${r.consecutive_over}/${r.sustain_seconds} sn`
+                    ) : (
+                      <span className="muted">normal</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </Card>
+      {cur && (
+        <Card title={cur.rule_name} actions={<Seg value={unit} onChange={setUnit} options={[{ id: "pps", label: "paket/sn" }, { id: "bps", label: "bit/sn" }]} />}>
+          <ThresholdLine
+            data={(cur.recent_seconds ?? []) as unknown as Record<string, number>[]}
+            dataKey={unit}
+            unit={unit}
+            threshold={unit === "pps" ? cur.threshold_pps : cur.threshold_bps}
+            baseline={cur.baseline_ready ? (unit === "pps" ? cur.baseline_pps : cur.baseline_bps) : undefined}
+          />
+          <dl className="kv" style={{ marginTop: 12 }}>
+            <dt>Efektif eşik</dt>
+            <dd>
+              {cur.threshold_pps ? pps(cur.threshold_pps) : "-"} · {cur.threshold_bps ? bps(cur.threshold_bps) : "-"}
+            </dd>
+            <dt>Normal seviye</dt>
+            <dd>{cur.baseline_ready ? `${pps(cur.baseline_pps)} · ${bps(cur.baseline_bps)}` : "öğreniliyor"}</dd>
+            <dt>Koşullar</dt>
+            <dd>{cur.conditions === "ok" ? "sağlanıyor" : cur.conditions}</dd>
+            <dt>Tetik</dt>
+            <dd>{cur.sustain_seconds} sn üst üste eşik aşımı gerekir</dd>
+          </dl>
+        </Card>
+      )}
     </div>
   );
 }
