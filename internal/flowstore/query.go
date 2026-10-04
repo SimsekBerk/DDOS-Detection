@@ -42,6 +42,30 @@ func parsePrefix(s string) (netip.Prefix, error) {
 	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
+// prefilter derives the cheap compact-form checks (src/dst prefix, object)
+// from the filter; invalid values are reported by Compile.
+func (f Filter) prefilter() *prefilter {
+	var p prefilter
+	if f.Src != "" {
+		if pfx, err := parsePrefix(f.Src); err == nil {
+			p.src = newPrefixMatch(pfx)
+		}
+	}
+	if f.Dst != "" {
+		if pfx, err := parsePrefix(f.Dst); err == nil {
+			p.dst = newPrefixMatch(pfx)
+		}
+	}
+	if f.ObjectID != nil {
+		id := int32(*f.ObjectID)
+		p.object = &id
+	}
+	if !p.src.on && !p.dst.on && p.object == nil {
+		return nil
+	}
+	return &p
+}
+
 // Compile turns a filter into a predicate and the lookback start time.
 func (f Filter) Compile(now int64) (Predicate, int64, error) {
 	secs := f.Seconds
@@ -326,7 +350,7 @@ func (s *Store) TopN(f Filter, extra Predicate, dim, metric string, limit int, o
 	}
 	m := map[string]*agg{}
 	var tot agg
-	s.Scan(since, func(r *flow.Record) bool {
+	s.scan(since, f.prefilter(), func(r *flow.Record) bool {
 		if !pred(r) || (extra != nil && !extra(r)) {
 			return true
 		}
@@ -397,7 +421,7 @@ func (s *Store) Breakdown(f Filter, extra Predicate, topLimit int) (*Breakdown, 
 	var tot agg
 	var fragBytes float64
 	rates := map[uint32]bool{}
-	s.Scan(since, func(r *flow.Record) bool {
+	s.scan(since, f.prefilter(), func(r *flow.Record) bool {
 		if !pred(r) || (extra != nil && !extra(r)) {
 			return true
 		}
@@ -509,7 +533,7 @@ func (s *Store) Samples(f Filter, extra Predicate, limit int) ([]SampleFlow, err
 		limit = 50
 	}
 	out := []SampleFlow{}
-	s.Scan(since, func(r *flow.Record) bool {
+	s.scan(since, f.prefilter(), func(r *flow.Record) bool {
 		if pred(r) && (extra == nil || extra(r)) {
 			out = append(out, ToSample(r))
 		}

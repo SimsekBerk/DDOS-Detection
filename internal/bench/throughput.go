@@ -102,7 +102,7 @@ func EngineThroughput(o Options, d time.Duration) ThroughputResult {
 	}
 	clock := now.Unix()
 	eng.SetClock(func() int64 { return clock })
-	const batch = 512
+	const batch = 1024 // collector batch size
 	start := time.Now()
 	total := 0
 	lastEval := time.Now()
@@ -124,7 +124,7 @@ func EngineThroughput(o Options, d time.Duration) ThroughputResult {
 	}
 	el := time.Since(start).Seconds()
 	return ThroughputResult{Stage: "engine", Encoder: "ipfix", Records: total, Seconds: el, RecordsPerSec: float64(total) / el,
-		Note: fmt.Sprintf("52 kural, %d seri, flow tamponu dahil, tek çekirdek", eng.Snapshot().Series)}
+		Note: fmt.Sprintf("52 kural, %d seri, flow tamponu dahil, 1024 kayıtlık partiler", eng.Snapshot().Series)}
 }
 
 // EndToEnd sends datagrams over UDP loopback to a live collector+engine at

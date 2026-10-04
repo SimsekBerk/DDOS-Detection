@@ -128,6 +128,8 @@ Kapsam:
 go run ./cmd/ddos-bench detect                     # 27 senaryo × 4 telemetri: algılama, algılama süresi, bitiş
 go run ./cmd/ddos-bench baseline -baseline-minutes 120 -phases 6   # yalnızca normal trafik: yanlış alarm
 go run ./cmd/ddos-bench throughput                 # decode, motor ve UDP uçtan uca kapasite
+go run ./cmd/ddos-bench sizing -network-pps 330e6 -sampling 1000 -prefixes 2000 -hosts 100000 -rate 330000
+                                                   # operatör ölçeği: doluluk, değerlendirme süresi, bellek (+ -attack-pps 300e6)
 go run ./cmd/ddos-bench all -json sonuc.json       # hepsi + JSON çıktı
 ```
 

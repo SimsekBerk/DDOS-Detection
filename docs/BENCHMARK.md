@@ -11,8 +11,8 @@
 | Algılama süresi, NetFlow/IPFIX (10 sn active timeout) | **12–20 sn** (medyan 15) | Aynı fiziksel sınır: export süresi |
 | Normal trafikte yanlış olay (48 simüle saat) | **0** | Yayımlanmış veri yok |
 | AI analist için aday sinyal gürültüsü | 48 saatte 1–3 (saatte ≤0,06) | — (LLM analist yok) |
-| Flow kapasitesi | Tek düğüm, tek exporter: **2M kayıt/sn kayıpsız** | Sistem genelinde "24M flow/sn'ye kadar" (dağıtık Collector'larla); eski appliance modelleri 20k–50k flow/sn |
-| Decode (tek çekirdek) | NetFlow v9 7,5M · IPFIX 7,2M · sFlow 10,9M kayıt/sn | Yayımlanmamış |
+| Flow kapasitesi | Tek düğüm: tek exporter'dan **2M kayıt/sn kayıpsız**; operatör yüküyle (2.000 prefix, 100 bin host) **~1,4–2,5M kayıt/sn** | Sistem genelinde "24M flow/sn'ye kadar" (dağıtık Collector'larla); eski appliance modelleri 20k–50k flow/sn |
+| Decode (tek çekirdek) | NetFlow v9 6,6–7,5M · IPFIX 6,8–7,2M · sFlow 10,3–10,9M kayıt/sn | Yayımlanmamış |
 | Ölçümün tekrarlanabilirliği | `ddos-bench` ile herkes tekrarlayabilir | Kapalı |
 
 **Önemli uyarı:** GenieATM'i bu çalışmada çalıştırma imkânımız olmadı. GenieATM için bağımsız ve yayımlanmış bir benchmark da yok (NSS Labs 2020'de kapandı; analist raporları bulut scrubbing servislerini değerlendiriyor). Tablodaki GenieATM değerleri üreticinin pazarlama materyallerinden ve eski tekliflerden alınmıştır, doğrulanmamıştır. ddosd değerleri sentetik trafikle ölçülmüştür. İki ürünü adil şekilde karşılaştırmanın tek yolu aynı router'lardan aynı flow'larla paralel çalıştırmaktır; yöntem §5'te.
@@ -119,14 +119,29 @@ Aday sinyaller olay değildir; AI analistin incelemesi için kuyruğa düşer. N
 
 | Aşama | Sonuç |
 |---|---|
-| Decode, tek çekirdek | NetFlow v9 **7,48M**, IPFIX **7,21M**, sFlow **10,94M** kayıt/sn |
-| Motor, tek çekirdek (52 kural, 1.283 seri) | **2,21M** kayıt/sn |
+| Decode, tek çekirdek | NetFlow v9 **6,6–7,5M**, IPFIX **6,8–7,2M**, sFlow **10,3–10,9M** kayıt/sn (koşudan koşuya) |
+| Motor, küçük yük (2 prefix, 1.281 seri, 1.024 kayıtlık partiler) | **1,9M** kayıt/sn; operatör yükü için §2.4 |
 | Uçtan uca UDP, hedef 0,5M / 1M / 2M kayıt/sn | %0 kayıp |
-| Uçtan uca UDP, hedef 3M / 4M kayıt/sn | 2,58M kayıt/sn'de doyma (%14 / %35 kayıp, worker kuyruğunda) |
+| Uçtan uca UDP, hedef 3M / 4M kayıt/sn | ~2,6–2,7M kayıt/sn'de doyma (worker kuyruğunda; motorda kayıp yok) |
 
 Tek exporter'ın tüm datagram'ları sıra ve şablon tutarlılığı için tek worker'a düşer; doyma noktası bu worker'dır. Birden çok router'dan gelen trafik worker'lara dağılır ve çekirdek sayısıyla ölçeklenir. Motor kuyruğunda hiç kayıp olmadı.
 
-### 2.4 Dayanıklılık
+### 2.4 Operatör ölçeğinde boyutlandırma
+
+`ddos-bench sizing`, 2,8 Tbps / 330 Mpps tepeli, 9 router'lı bir operatör ağını taklit eder: 2.000 müşteri prefix'i (/24, /22, /20), Zipf dağılımlı 100 bin aktif hedef host, 1:1000 örnekleme, 30 sn adli flow geçmişi. Kayıtlar simüle saatle sınıflandırma ve motordan geçer; isteğe bağlı olarak belirli sayıda hedefe yoğunlaşan bir saldırı eklenir.
+
+| Senaryo | Kayıt/sn | Motor doluluğu | Değerlendirme | Seri | Bellek |
+|---|---|---|---|---|---|
+| NetFlow/IPFIX 1:1000, tepe | 150 bin | %6 | 25 ms/sn | 710 bin | 2,1 GB |
+| sFlow 1:1000, tepe | 330 bin | %12 | 33 ms/sn | 840 bin | 2,9 GB |
+| Tepe + 300 Mpps saldırı (20 hedef) | 630 bin | %22 | 35 ms/sn | 840 bin | 3,2 GB |
+| Tepe + 700 Mpps saldırı (50 hedef) | 1,03 milyon | %41 | 41 ms/sn | 840 bin | 3,6 GB |
+| Tepe + 1,7 Gpps saldırı (200 hedef) | 2,03 milyon | %143 (sınır ≈1,4 milyon) | 127 ms/sn | 840 bin | 4,8 GB |
+| Tepe, 500 bin aktif host | 330 bin | %19 | 82 ms/sn | 2 milyon (sınırda) | 4,8 GB |
+
+Motor doluluğu %100'ün altında kaldıkça motor gerçek zamanda yetişir. Bu ölçek için gereken ayarlar ve sunucu sınıfları [OPERATIONS.md](OPERATIONS.md) §1'de.
+
+### 2.5 Dayanıklılık
 
 - Decoder fuzz testi: 60 sn'de **21,7M** rastgele/bozuk paket, çökme veya panik yok.
 - Tüm paketler `go test -race` ile yarış durumu (data race) olmadan geçer.
@@ -150,6 +165,10 @@ Bu benchmark yalnızca ölçüm için değil, ürünü düzeltmek için kullanı
 | Ayar ekranı (tarayıcı testi) | Kural eşiği ters gösteriliyordu; syslog testi protokolsüz başarısız; yeni token listede görünmüyordu; geri alınan değişiklikte "yeniden başlatma gerekli" kalıyordu | Hepsi düzeltildi, API testleri eklendi | |
 | Arayüz taşmaları | 1024 px'te tablolar ve KPI değerleri, mobilde mitigasyon kartları ekrandan taşıyordu | Tablo/kart düzeni; 375 / 768 / 1024 / 1440 px'te otomatik taşma taraması | 22 sayfada taşma yok |
 | Normal bağlantılar "TCP XMAS" saldırısı sanılıyordu | Gerçek trafikle preprod testinde bulundu: flow kayıtlarında bayraklar bağlantı boyunca birleşir, tamamlanmış bir HTTPS bağlantısı `SYN\|ACK\|PSH\|FIN` görünür ve SYN+FIN kuralına uyar. Simülatörün normal trafiği gerçekçi bayraklarla üretilince benchmark da 8 saatte 259 sahte olay gösterdi | `tcp_xmas_synfin` (ACK yok), `tcp_rst_flood` (SYN/PSH yok) ve `tcp_synack_reflection` (PSH yok) kuralları gerçek saldırı imzasına göre daraltıldı; simülatörün normal trafiği gerçekçi bayraklar taşıyor; regresyon testi eklendi | 259 → 0 sahte olay; 108/108 korundu |
+| Çok prefix'li ağlarda sınıflandırma çöküyordu | Korunan prefix'ler her kayıtta sırayla taranıyordu: 5.000 prefix'te adres başına 12 µs, tek çekirdekte ~40 bin kayıt/sn | Prefix uzunluğuna göre hash'li en-uzun-eşleşme | 12 µs → 36 ns; eski yöntemle eşdeğerlik testi |
+| Operatör ölçeğinde motor gerçek zamanı yakalayamıyordu | 100 bin host / 840 bin seride saniyelik değerlendirme 1,76 sn sürüyordu (150 bin kayıt/sn'de doluluk %209) | Seri yapısı küçültüldü (4,2 → 1,7 KB), açıklama metinleri yalnızca gerektiğinde üretiliyor, seriler parçalara bölündü; kayıt işleme ve değerlendirme paralel; korelasyon yalnızca aktif vektörlere bakıyor | Doluluk %209 → %6–12; değerlendirme 1.762 → 25–33 ms |
+| Saldırı anında adli kanıt toplama motoru boğuyordu | Her olay için son 30 sn'lik flow deposunun tamamı taranıyordu (CPU'nun %50'si) | Flow deposu işaretçisiz ve sıkıştırılmış biçimde (176 → 104 bayt/kayıt); hedefe göre ön eleme; eşzamanlı tarama sınırı | +300 Mpps saldırıda doluluk %104 → %22 |
+| Nesne başına bellek | Her nesne için 1 saatlik saniyelik geçmiş (~520 KB) | Nesnelerde 15 dk saniyelik + 24 sa dakikalık (~240 KB) | 2.000 nesnede ~1 GB → ~0,5 GB |
 | Docker'da ayar kaydedilemiyordu | Yapılandırma salt okunur tek dosya olarak bağlıydı; `data_dir` volume'a gitmiyordu | Yazılabilir yapılandırma dizini, yerinde yazma geri dönüşü, arayüzde uyarı | |
 
 ---

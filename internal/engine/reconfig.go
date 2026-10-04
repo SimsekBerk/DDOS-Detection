@@ -31,19 +31,17 @@ func (e *Engine) UpdateConfig(cfg *config.Config) error {
 				idMap[o.ID] = id
 			}
 		}
-		remapped := map[seriesKey]*series{}
-		for k, s := range e.series {
+		e.st.rebuild(func(k seriesKey, s *series) (seriesKey, bool) {
 			nid, ok := idMap[k.obj]
 			if !ok {
 				if s.active {
 					e.endVector(s, e.set.Rules[k.rule], now)
 				}
-				continue
+				return k, false
 			}
 			k.obj = nid
-			remapped[k] = s
-		}
-		e.series = remapped
+			return k, true
+		}, func(k seriesKey) int { return shardOfKey(k, next, len(e.st.shards)) })
 		e.totals.remap(len(next.objects), idMap)
 		e.incidents.remapObjects(idMap)
 

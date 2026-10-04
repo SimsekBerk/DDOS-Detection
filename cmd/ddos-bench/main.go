@@ -29,11 +29,12 @@ type report struct {
 	Detection  []bench.Result           `json:"detection,omitempty"`
 	Baseline   []bench.BaselineResult   `json:"baseline,omitempty"`
 	Throughput []bench.ThroughputResult `json:"throughput,omitempty"`
+	Sizing     []bench.SizingResult     `json:"sizing,omitempty"`
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "kullanım: ddos-bench detect|baseline|throughput|all [-rules dir] [-json out.json] [-only ids] [-tel names]")
+		fmt.Fprintln(os.Stderr, "kullanım: ddos-bench detect|baseline|throughput|sizing|all [-rules dir] [-json out.json] [-only ids] [-tel names]")
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
@@ -45,6 +46,17 @@ func main() {
 	baselineMin := fs.Int("baseline-minutes", 60, "simulated minutes for the false-positive run")
 	workers := fs.Int("workers", runtime.NumCPU(), "parallel scenario workers")
 	phases := fs.Int("phases", 1, "false-positive run: repeat with this many start phases of the traffic wave")
+	rates := fs.String("rate", "150000,350000,1000000", "sizing: flow records per second (comma separated)")
+	prefixes := fs.Int("prefixes", 2000, "sizing: protected customer prefixes")
+	hosts := fs.Int("hosts", 100000, "sizing: distinct active destination hosts")
+	exporters := fs.Int("exporters", 9, "sizing: routers exporting flows")
+	sampling := fs.Int("sampling", 1000, "sizing: packet sampling rate (1:N)")
+	seconds := fs.Int("seconds", 30, "sizing: simulated seconds per rate")
+	flowSeconds := fs.Int("flow-seconds", 30, "sizing: seconds of flow history kept for forensics")
+	maxSeries := fs.Int("max-series", 2_000_000, "sizing: engine.max_series")
+	networkPPS := fs.Float64("network-pps", 0, "sizing: real packets/s described by the records (e.g. 330e6); 0 = 1-3 sampled packets per record")
+	attackPPS := fs.Float64("attack-pps", 0, "sizing: additional attack packets/s (real, before sampling)")
+	attackTargets := fs.Int("attack-targets", 20, "sizing: hosts hit by the attack")
 	_ = fs.Parse(os.Args[2:])
 
 	opts := bench.Options{RulesDir: *rules}
@@ -89,6 +101,23 @@ func main() {
 			r := bench.EndToEnd(opts, "ipfix", rate, 5*time.Second)
 			rep.Throughput = append(rep.Throughput, r)
 			fmt.Printf("e2e-udp  %-9s %12.0f kayıt/sn  kayıp %%%.2f  %s\n", r.Encoder, r.RecordsPerSec, r.LossPct, r.Note)
+		}
+	}
+	if cmd == "sizing" {
+		fmt.Printf("sizing: %d prefix, %d aktif host, %d exporter, örnekleme 1:%d, %d sn flow geçmişi\n", *prefixes, *hosts, *exporters, *sampling, *flowSeconds)
+		for _, rs := range strings.Split(*rates, ",") {
+			var rate int
+			fmt.Sscan(strings.TrimSpace(rs), &rate)
+			r := bench.Sizing(opts, bench.SizingOptions{RecordsPerSec: rate, Prefixes: *prefixes, Hosts: *hosts, Exporters: *exporters,
+				Sampling: uint32(*sampling), Seconds: *seconds, FlowSeconds: *flowSeconds, MaxSeries: *maxSeries,
+				NetworkPPS: *networkPPS, AttackPPS: *attackPPS, AttackTargets: *attackTargets})
+			rep.Sizing = append(rep.Sizing, r)
+			if r.Note != "" {
+				fmt.Println("  hata:", r.Note)
+				continue
+			}
+			fmt.Printf("  %8d kayıt/sn → motor doluluğu %%%5.1f (kapasite %8.0f kayıt/sn) | değerlendirme %5.1f ms/sn | sınıflandırma %8.0f kayıt/sn/çekirdek | seri %7d (taşma %d) | olay %d | bellek %6.0f MB (flow deposu %5.0f, nesne/kural %4.0f, seriler %5.0f)\n",
+				r.TotalRecords, 100*r.Utilization, r.EngineCapacity, r.EvalMillis, r.ClassifyPerCore, r.Series, r.SeriesOverflow, r.Incidents, r.HeapMB, r.FlowstoreMB, r.BaseMB, r.SeriesMB)
 		}
 	}
 	if *jsonOut != "" {

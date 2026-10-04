@@ -127,17 +127,23 @@ type Engine struct {
 	inbound      []*rules.Compiled
 	outbound     []*rules.Compiled
 	eff          [][]effEntry
-	series       map[seriesKey]*series
+	st           *seriesTable // sharded (rule, target) series
 	lastEvidence map[string]int64
-	// per-rule last series cache (attack traffic hits the same target in a row)
-	lastKey    [rules.MaxRules]seriesKey
-	lastSeries [rules.MaxRules]*series
+	recShard     []uint16 // per-record shard of the batch being ingested (reused)
+	mergeBuf     []flow.Record
 
 	window    int64
 	maxSpread int64
 	tau       float64
 	learn     float64
-	firstEval int64 // time of the first evaluation (start of global learning)
+	firstEval int64          // time of the first evaluation (start of global learning)
+	evalActs  [][]evalAction // reused per tick, one list per shard
+	// active vectors per object, rebuilt each tick: correlation only needs
+	// these, not every series
+	activeIdx map[int32][]seriesRef
+	// evidenceSem bounds concurrent forensic scans of the flow store; each
+	// scans the whole window, which is costly at provider rates
+	evidenceSem chan struct{}
 
 	clock   func() int64
 	running atomic.Bool // Run loop active; otherwise Do executes inline (offline replay)
@@ -158,7 +164,7 @@ func New(cfg *config.Config, st *flowstore.Store, log *slog.Logger) (*Engine, er
 		cfg: cfg, objs: newObjectTable(cfg.Objects), store: st,
 		incidents: newIncidents(cfg.Engine.IncidentReopen.Duration), signals: newSignals(),
 		in: make(chan []flow.Record, cfg.Collector.QueueSize), ctrl: make(chan func(), 64),
-		series: map[seriesKey]*series{}, lastEvidence: map[string]int64{},
+		st: newSeriesTable(defaultShards()), lastEvidence: map[string]int64{}, evidenceSem: make(chan struct{}, 2),
 		window:    int64(cfg.Engine.Window.Seconds()),
 		maxSpread: int64(cfg.Engine.MaxFlowSpread.Seconds()),
 		tau:       cfg.Engine.BaselineTau.Seconds(),
@@ -250,7 +256,7 @@ func (e *Engine) rebuildClassifier() {
 		}
 	}
 	e.cls.Store(cl)
-	e.lastSeries = [rules.MaxRules]*series{}
+	e.st.resetCache()
 }
 
 // Classify sets object, direction and matching rules on records. It is safe
@@ -345,7 +351,7 @@ func (e *Engine) Run(ctx context.Context) {
 			e.persist()
 			return
 		case batch := <-e.in:
-			e.ingest(batch)
+			e.ingest(e.drain(batch))
 		case f := <-e.ctrl:
 			f()
 		case t := <-tick.C:
@@ -368,6 +374,11 @@ func (e *Engine) persist() {
 func (e *Engine) ingest(batch []flow.Record) {
 	now := e.clock()
 	cl := e.cls.Load()
+	n := len(e.st.shards)
+	if cap(e.recShard) < len(batch) {
+		e.recShard = make([]uint16, len(batch))
+	}
+	shardOf := e.recShard[:len(batch)]
 	for i := range batch {
 		r := &batch[i]
 		if r.ClassGen != cl.gen {
@@ -376,19 +387,84 @@ func (e *Engine) ingest(batch []flow.Record) {
 		if r.ReceivedUnix == 0 || r.ReceivedUnix > now || r.ReceivedUnix < now-5 {
 			r.ReceivedUnix = now
 		}
+		// Host and carpet-prefix series of a record live in the shard of its
+		// carpet prefix.
+		if n > 1 && r.ObjectID >= 0 {
+			target := r.Dst
+			if r.Direction == flow.DirOutbound {
+				target = r.Src
+			}
+			shardOf[i] = uint16(prefixHash(e.objs.objects[r.ObjectID].carpetPrefix(target)) % uint32(n))
+		}
 	}
-	e.store.Append(batch)
 	e.recordsIn.Add(uint64(len(batch)))
+	if n == 1 || len(batch) < parallelIngestMin {
+		e.store.Append(batch)
+		e.addTotals(batch)
+		for w := 0; w < n; w++ {
+			e.ingestShard(w, batch, shardOf)
+		}
+		return
+	}
+	// The flow store, the traffic totals and every series shard are
+	// independent: update them in parallel.
+	var wg sync.WaitGroup
+	wg.Add(n + 2)
+	go func() { defer wg.Done(); e.store.Append(batch) }()
+	go func() { defer wg.Done(); e.addTotals(batch) }()
+	for w := 0; w < n; w++ {
+		go func(w int) { defer wg.Done(); e.ingestShard(w, batch, shardOf) }(w)
+	}
+	wg.Wait()
+}
 
+// ingestMerge: queued collector batches are merged up to this many records
+// so the parallel ingest amortizes its coordination; parallelIngestMin: below
+// this a single goroutine is cheaper.
+const (
+	ingestMerge       = 16384
+	parallelIngestMin = 2048
+)
+
+// drain merges batches already waiting in the queue into one.
+func (e *Engine) drain(first []flow.Record) []flow.Record {
+	if len(first) >= ingestMerge {
+		return first
+	}
+	buf := e.mergeBuf[:0]
+	buf = append(buf, first...)
+	for len(buf) < ingestMerge {
+		select {
+		case b := <-e.in:
+			buf = append(buf, b...)
+		default:
+			e.mergeBuf = buf
+			return buf
+		}
+	}
+	e.mergeBuf = buf
+	return buf
+}
+
+func (e *Engine) addTotals(batch []flow.Record) {
 	e.totals.mu.Lock()
 	for i := range batch {
 		e.totals.addLocked(&batch[i], batch[i].ReceivedUnix, e.maxSpread)
 	}
 	e.totals.mu.Unlock()
+}
 
+// ingestShard adds the records' contributions to the series of shard w.
+func (e *Engine) ingestShard(w int, batch []flow.Record, shardOf []uint16) {
+	sh := e.st.shards[w]
+	n := len(e.st.shards)
 	for i := range batch {
 		r := &batch[i]
 		if r.ObjectID < 0 {
+			continue
+		}
+		hostShard, objShard := int(shardOf[i]), int(r.ObjectID)%n
+		if hostShard != w && objShard != w {
 			continue
 		}
 		obj := e.objs.objects[r.ObjectID]
@@ -396,30 +472,41 @@ func (e *Engine) ingest(batch []flow.Record) {
 		if r.Direction == flow.DirOutbound {
 			target, peer = r.Src, r.Dst
 		}
-		for w, bits := range r.Matched {
+		for word, bits := range r.Matched {
 			for bits != 0 {
-				idx := w<<6 | bits64(bits)
+				idx := word<<6 | bits64(bits)
 				bits &= bits - 1
 				c := e.set.Rules[idx]
 				key := seriesKey{rule: uint16(idx), obj: r.ObjectID}
 				switch c.Scope {
 				case "host":
+					if hostShard != w {
+						continue
+					}
 					key.pfx = netip.PrefixFrom(target, target.BitLen())
 				case "prefix":
+					if hostShard != w {
+						continue
+					}
 					key.pfx = obj.carpetPrefix(target)
+				default:
+					if objShard != w {
+						continue
+					}
 				}
-				s := e.lastSeries[idx]
-				if s == nil || e.lastKey[idx] != key {
-					s = e.series[key]
+				s := sh.lastSeries[idx]
+				if s == nil || sh.lastKey[idx] != key {
+					s = sh.m[key]
 					if s == nil {
-						if c.Scope == "host" && len(e.series) >= e.cfg.Engine.MaxSeries {
+						if c.Scope == "host" && e.st.len() >= e.cfg.Engine.MaxSeries {
 							e.seriesOverflow.Add(1)
 							continue
 						}
-						s = &series{trackUniques: c.Conditions.MinUniqueSources > 0, trackDests: c.Conditions.MinUniqueDests > 0 && c.Scope != "host"}
-						e.series[key] = s
+						s = &series{shard: uint16(w), trackUniques: c.Conditions.MinUniqueSources > 0, trackDests: c.Conditions.MinUniqueDests > 0 && c.Scope != "host"}
+						sh.m[key] = s
+						e.st.count.Add(1)
 					}
-					e.lastKey[idx], e.lastSeries[idx] = key, s
+					sh.lastKey[idx], sh.lastSeries[idx] = key, s
 				}
 				s.add(r, r.ReceivedUnix, e.maxSpread, peer, target)
 			}
@@ -434,10 +521,60 @@ func bits64(x uint64) int { return bits.TrailingZeros64(x) }
 type checkResult struct {
 	ratio, staticRatio, baseRatio float64
 	hit, condOK                   bool
-	kind, reason, condFail        string
+	kind                          string // static | baseline
 	z                             float64
 	basePPS, baseBPS              float64
 	ready                         bool
+
+	// Inputs of the human-readable texts. They are formatted only when an
+	// incident, signal or target analysis needs them (reason, condFail):
+	// formatting for every series every second dominated allocation.
+	metric       string // pps | bps | fps of the deciding static threshold
+	val, thr     float64
+	bMetric      string
+	bVal, bLvl   float64
+	factor       float64
+	cond         condCode
+	condA, condB float64
+}
+
+type condCode uint8
+
+const (
+	condNone condCode = iota
+	condSamples
+	condSources
+	condDests
+	condMinSize
+	condMaxSize
+)
+
+// reason describes why the rule is (near) triggering, e.g. "bps 649Mbps ≥ eşik 400Mbps".
+func (r *checkResult) reason() string {
+	if r.kind == "baseline" {
+		return fmt.Sprintf("%s %s ≥ baseline×%.0f (%s)", r.bMetric, human(r.bVal, r.bMetric), r.factor, human(r.bLvl, r.bMetric))
+	}
+	if r.metric == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s %s ≥ eşik %s", r.metric, human(r.val, r.metric), human(r.thr, r.metric))
+}
+
+// condFail describes the unmet validation condition, or "".
+func (r *checkResult) condFail() string {
+	switch r.cond {
+	case condSamples:
+		return fmt.Sprintf("örnek sayısı %.0f < %.0f", r.condA, r.condB)
+	case condSources:
+		return fmt.Sprintf("benzersiz kaynak %.0f < %.0f", r.condA, r.condB)
+	case condDests:
+		return fmt.Sprintf("etkilenen benzersiz hedef %.0f < %.0f", r.condA, r.condB)
+	case condMinSize:
+		return fmt.Sprintf("ortalama paket %.0fB < %.0fB", r.condA, r.condB)
+	case condMaxSize:
+		return fmt.Sprintf("ortalama paket %.0fB > %.0fB", r.condA, r.condB)
+	}
+	return ""
 }
 
 func (e *Engine) check(c *rules.Compiled, ent effEntry, s *series, r rate, uniq, dests int) checkResult {
@@ -483,14 +620,12 @@ func (e *Engine) check(c *rules.Compiled, ent effEntry, s *series, r rate, uniq,
 		}
 	}
 	res.ratio = math.Max(res.staticRatio, res.baseRatio)
+	res.metric, res.val, res.thr = metric, val, thr
+	res.bMetric, res.bVal, res.bLvl, res.factor = bMetric, bVal, bLvl, c.Baseline.Factor
 	if res.staticRatio >= res.baseRatio {
 		res.kind = "static"
-		if metric != "" {
-			res.reason = fmt.Sprintf("%s %s ≥ eşik %s", metric, human(val, metric), human(thr, metric))
-		}
 	} else {
 		res.kind = "baseline"
-		res.reason = fmt.Sprintf("%s %s ≥ baseline×%.0f (%s)", bMetric, human(bVal, bMetric), c.Baseline.Factor, human(bLvl, bMetric))
 	}
 
 	res.condOK = true
@@ -498,17 +633,18 @@ func (e *Engine) check(c *rules.Compiled, ent effEntry, s *series, r rate, uniq,
 	if minSamples == 0 {
 		minSamples = 3
 	}
+	fail := func(code condCode, a, b float64) { res.condOK, res.cond, res.condA, res.condB = false, code, a, b }
 	switch {
 	case r.Samples < float64(minSamples):
-		res.condOK, res.condFail = false, fmt.Sprintf("örnek sayısı %0.f < %d", r.Samples, minSamples)
+		fail(condSamples, r.Samples, float64(minSamples))
 	case c.Conditions.MinUniqueSources > 0 && uniq < c.Conditions.MinUniqueSources:
-		res.condOK, res.condFail = false, fmt.Sprintf("benzersiz kaynak %d < %d", uniq, c.Conditions.MinUniqueSources)
+		fail(condSources, float64(uniq), float64(c.Conditions.MinUniqueSources))
 	case c.Conditions.MinUniqueDests > 0 && c.Scope != "host" && dests < c.Conditions.MinUniqueDests:
-		res.condOK, res.condFail = false, fmt.Sprintf("etkilenen benzersiz hedef %d < %d", dests, c.Conditions.MinUniqueDests)
+		fail(condDests, float64(dests), float64(c.Conditions.MinUniqueDests))
 	case c.Conditions.MinAvgPacketSize > 0 && r.AvgPktSize < c.Conditions.MinAvgPacketSize:
-		res.condOK, res.condFail = false, fmt.Sprintf("ortalama paket %.0fB < %.0fB", r.AvgPktSize, c.Conditions.MinAvgPacketSize)
+		fail(condMinSize, r.AvgPktSize, c.Conditions.MinAvgPacketSize)
 	case c.Conditions.MaxAvgPacketSize > 0 && r.AvgPktSize > c.Conditions.MaxAvgPacketSize:
-		res.condOK, res.condFail = false, fmt.Sprintf("ortalama paket %.0fB > %.0fB", r.AvgPktSize, c.Conditions.MaxAvgPacketSize)
+		fail(condMaxSize, r.AvgPktSize, c.Conditions.MaxAvgPacketSize)
 	}
 	res.hit = res.ratio >= 1 && res.condOK
 	return res
@@ -552,19 +688,136 @@ func (e *Engine) evaluate(now int64) {
 	if e.firstEval == 0 {
 		e.firstEval = now
 	}
-	w := e.window
-	learnedIdle := int64(3600)
+	e.st.resetCache() // series may be deleted below
+
+	// Phase A (parallel, one worker per shard): per-series work that only
+	// touches the series itself — window rate, threshold check, baseline,
+	// counters. Phase B (serial): the rare decisions that change shared state.
+	shards := e.st.shards
+	workers := len(shards)
+	if e.st.len() < parallelEvalMin {
+		workers = 1
+	}
+	if len(e.evalActs) < len(shards) {
+		e.evalActs = make([][]evalAction, len(shards))
+	}
+	if workers == 1 {
+		for i, sh := range shards {
+			e.evalActs[i] = e.evalShard(sh, now, e.evalActs[i][:0])
+		}
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(len(shards))
+		for i, sh := range shards {
+			go func(i int, sh *seriesShard) {
+				defer wg.Done()
+				e.evalActs[i] = e.evalShard(sh, now, e.evalActs[i][:0])
+			}(i, sh)
+		}
+		wg.Wait()
+	}
+	workers = len(shards)
+
 	var pending []pendingStart
-	e.lastSeries = [rules.MaxRules]*series{} // series may be deleted below
-	for key, s := range e.series {
+	if e.activeIdx == nil {
+		e.activeIdx = map[int32][]seriesRef{}
+	}
+	for k, v := range e.activeIdx {
+		e.activeIdx[k] = v[:0]
+	}
+	for _, acts := range e.evalActs[:workers] {
+		for i := range acts {
+			a := &acts[i]
+			c := e.set.Rules[a.key.rule]
+			switch a.kind {
+			case actDisable:
+				if a.s.active {
+					e.endVector(a.s, c, now)
+				}
+				e.st.remove(a.key, a.s)
+			case actDelete:
+				e.st.remove(a.key, a.s)
+			case actSignal:
+				e.emitSignal(a.signal, a.key, c, e.eff[a.key.rule][a.key.obj], a.s, a.r, &a.res, now)
+			case actStart, actPending:
+				target, scope := e.targetOf(a.key, c)
+				p := pendingStart{a.key, a.s, c, e.eff[a.key.rule][a.key.obj], e.objs.objects[a.key.obj], a.r, a.res, a.uniq, target, scope, c.ID + "|" + c.Direction + "|" + target}
+				if a.kind == actStart {
+					e.startVector(p, now)
+					e.activeIdx[a.key.obj] = append(e.activeIdx[a.key.obj], seriesRef{a.key, a.s})
+				} else {
+					pending = append(pending, p)
+				}
+			case actActive:
+				e.incidents.updateVector(a.s.incident, c.ID, a.r, a.uniq, now)
+				if a.end {
+					e.endVector(a.s, c, now)
+				} else {
+					e.activeIdx[a.key.obj] = append(e.activeIdx[a.key.obj], seriesRef{a.key, a.s})
+				}
+			}
+		}
+		clear(acts)
+	}
+	e.resolvePending(pending, now)
+	e.incidents.tick(now)
+	e.totals.roll(now)
+
+	// periodic evidence refresh for active incidents
+	for _, inc := range e.incidents.List("active", 0) {
+		if now-e.lastEvidence[inc.ID] >= int64(e.cfg.Engine.EvidenceEvery.Seconds()) {
+			e.lastEvidence[inc.ID] = now
+			go e.collectEvidence(inc.ID, "", e.window)
+		}
+	}
+	e.evalMillis = float64(time.Since(start).Microseconds()) / 1000
+	e.publish(now)
+}
+
+// Parallel evaluation: below parallelEvalMin series one goroutine is
+// cheaper than the coordination.
+var parallelEvalMin = 20_000 // var so tests can exercise the parallel path
+
+const maxEvalWorkers = 16
+
+type seriesRef struct {
+	key seriesKey
+	s   *series
+}
+
+type evalActionKind uint8
+
+const (
+	actDisable evalActionKind = iota + 1 // rule disabled for the object
+	actDelete                            // idle series
+	actSignal                            // candidate signal for the analyst
+	actStart                             // specific host vector reached sustain
+	actPending                           // generic/wider vector, decided after correlation
+	actActive                            // active vector: update incident, maybe end
+)
+
+type evalAction struct {
+	kind   evalActionKind
+	key    seriesKey
+	s      *series
+	r      rate
+	res    checkResult
+	uniq   int
+	signal string
+	end    bool
+}
+
+// evalShard runs phase A for one shard and returns the actions phase B must
+// apply. It reads engine configuration and mutates only the shard's series.
+func (e *Engine) evalShard(sh *seriesShard, now int64, acts []evalAction) []evalAction {
+	w := e.window
+	const learnedIdle = int64(3600)
+	minSig := e.cfg.Engine.SignalMinSeconds
+	for key, s := range sh.m {
 		c := e.set.Rules[key.rule]
 		ent := e.eff[key.rule][key.obj]
-		obj := e.objs.objects[key.obj]
 		if !ent.enabled {
-			if s.active {
-				e.endVector(s, c, now)
-			}
-			delete(e.series, key)
+			acts = append(acts, evalAction{kind: actDisable, key: key, s: s})
 			continue
 		}
 		r := s.window(now, w)
@@ -581,74 +834,63 @@ func (e *Engine) evaluate(now int64) {
 		// Unique peers are tracked only for series that approach a threshold.
 		s.warm = s.active || res.ratio >= 0.25
 
-		if !s.active {
-			// Sustain counts consecutive evaluations over threshold. A single
-			// burst that lingers in the sliding window (traffic in only one
-			// second) never counts; bursty NetFlow/IPFIX exports spread over
-			// several seconds do.
-			switch {
-			case !res.hit:
-				s.over = 0
-			case r.ActiveSeconds >= 2:
-				s.over++
-			}
-			target, scope := e.targetOf(key, c)
-			sigKey := c.ID + "|" + c.Direction + "|" + target
-			switch {
-			case s.over >= c.SustainSec && c.Scope == "host" && !c.Generic:
-				e.startVector(pendingStart{key, s, c, ent, obj, r, res, uniq, target, scope, sigKey}, now)
-			case s.over >= c.SustainSec:
-				// Generic and wider-scope vectors are decided after all specific
-				// host vectors of this tick (hierarchical correlation).
-				pending = append(pending, pendingStart{key, s, c, ent, obj, r, res, uniq, target, scope, sigKey})
-			default:
-				e.maybeSignal(sigKey, key, c, ent, s, r, res, target, scope, obj, now)
-			}
-			// Baseline learning is frozen while triggered; outliers are clipped.
-			if !res.hit {
-				x := r
-				if res.ready {
-					x.PPS = math.Min(x.PPS, s.bPPS+3*math.Sqrt(s.vPPS)+1)
-					x.BPS = math.Min(x.BPS, s.bBPS+3*math.Sqrt(s.vBPS)+1)
+		if s.active {
+			end := false
+			if res.ratio < 0.7 {
+				if s.under == 0 {
+					s.under = now
 				}
-				s.updateBaseline(x, e.tau)
+				end = now-s.under >= int64(c.HoldDownSec)
+			} else {
+				s.under = 0
 			}
-			idle := int64(ringSize)
-			if res.ready {
-				idle = learnedIdle
-			}
-			if now-s.lastSeen > idle {
-				delete(e.series, key)
-			}
+			acts = append(acts, evalAction{kind: actActive, key: key, s: s, r: r, uniq: uniq, end: end})
 			continue
 		}
-
-		// active vector
-		e.incidents.updateVector(s.incident, c.ID, r, uniq, now)
-		if res.ratio < 0.7 {
-			if s.under == 0 {
-				s.under = now
+		// Sustain counts consecutive evaluations over threshold. A single
+		// burst that lingers in the sliding window (traffic in only one
+		// second) never counts; bursty NetFlow/IPFIX exports spread over
+		// several seconds do.
+		switch {
+		case !res.hit:
+			s.over = 0
+		case r.ActiveSeconds >= 2:
+			s.over++
+		}
+		switch {
+		case s.over >= c.SustainSec && c.Scope == "host" && !c.Generic:
+			acts = append(acts, evalAction{kind: actStart, key: key, s: s, r: r, res: res, uniq: uniq})
+		case s.over >= c.SustainSec:
+			// Generic and wider-scope vectors are decided after all specific
+			// host vectors of this tick (hierarchical correlation).
+			acts = append(acts, evalAction{kind: actPending, key: key, s: s, r: r, res: res, uniq: uniq})
+		default:
+			// Persistence: short blips are normal at host level and must not
+			// wake the analyst.
+			if kind := e.signalKind(s, r, &res, now); kind == "" {
+				s.devSecs = 0
+			} else if s.devSecs++; s.devSecs >= minSig {
+				acts = append(acts, evalAction{kind: actSignal, key: key, s: s, r: r, res: res, signal: kind})
 			}
-			if now-s.under >= int64(c.HoldDownSec) {
-				e.endVector(s, c, now)
+		}
+		// Baseline learning is frozen while triggered; outliers are clipped.
+		if !res.hit {
+			x := r
+			if res.ready {
+				x.PPS = math.Min(x.PPS, s.bPPS+3*math.Sqrt(s.vPPS)+1)
+				x.BPS = math.Min(x.BPS, s.bBPS+3*math.Sqrt(s.vBPS)+1)
 			}
-		} else {
-			s.under = 0
+			s.updateBaseline(x, e.tau)
+		}
+		idle := int64(ringSize)
+		if res.ready {
+			idle = learnedIdle
+		}
+		if now-s.lastSeen > idle {
+			acts = append(acts, evalAction{kind: actDelete, key: key, s: s})
 		}
 	}
-	e.resolvePending(pending, now)
-	e.incidents.tick(now)
-	e.totals.roll(now)
-
-	// periodic evidence refresh for active incidents
-	for _, inc := range e.incidents.List("active", 0) {
-		if now-e.lastEvidence[inc.ID] >= int64(e.cfg.Engine.EvidenceEvery.Seconds()) {
-			e.lastEvidence[inc.ID] = now
-			go e.collectEvidence(inc.ID, "", e.window)
-		}
-	}
-	e.evalMillis = float64(time.Since(start).Microseconds()) / 1000
-	e.publish(now)
+	return acts
 }
 
 // pendingStart is a vector that reached its sustain time in this tick.
@@ -707,6 +949,7 @@ func (e *Engine) resolvePending(pending []pendingStart, now int64) {
 		}
 		p.s.coveredBy = ""
 		e.startVector(p, now)
+		e.activeIdx[p.key.obj] = append(e.activeIdx[p.key.obj], seriesRef{p.key, p.s})
 	}
 }
 
@@ -724,8 +967,9 @@ func (e *Engine) coverage(key seriesKey, c *rules.Compiled, r rate) (float64, st
 	prefixes := map[netip.Prefix][]vec{}
 	ci := int(key.rule)
 	by := ""
-	for k2, s2 := range e.series {
-		if !s2.active || k2 == key || k2.obj != key.obj {
+	for _, ref := range e.activeIdx[key.obj] {
+		k2, s2 := ref.key, ref.s
+		if !s2.active || k2 == key {
 			continue
 		}
 		c2 := e.set.Rules[k2.rule]
@@ -815,7 +1059,7 @@ func (e *Engine) startVector(p pendingStart, now int64) {
 		TargetKey: targetKey(c.Direction, p.scope, p.target), Target: p.target, Scope: p.scope, Direction: c.Direction, Object: p.obj,
 		Vector: Vector{
 			RuleID: c.ID, RuleName: c.Name, Category: c.Category, Severity: c.Severity,
-			Reason: res.reason, TriggerKind: res.kind,
+			Reason: res.reason(), TriggerKind: res.kind,
 			CurPPS: r.PPS, CurBPS: r.BPS, CurFPS: r.FPS, PeakPPS: r.PPS, PeakBPS: r.BPS,
 			UniqueSources: p.uniq, AvgPktSize: r.AvgPktSize,
 			ThresholdPPS: float64(p.ent.t.PPS), ThresholdBPS: float64(p.ent.t.BPS), ThresholdFPS: float64(p.ent.t.FPS),
@@ -825,7 +1069,7 @@ func (e *Engine) startVector(p pendingStart, now int64) {
 	id, isNew := e.incidents.startVector(vs, now)
 	s.active, s.incident, s.under, s.over = true, id, 0, 0
 	e.signals.markEscalated(p.sigKey, id)
-	e.log.Info("attack vector started", "incident", id, "rule", c.ID, "target", p.target, "reason", res.reason)
+	e.log.Info("attack vector started", "incident", id, "rule", c.ID, "target", p.target, "reason", res.reason())
 	if isNew {
 		e.lastEvidence[id] = now
 		go e.collectEvidence(id, c.ID, e.window)
@@ -847,19 +1091,14 @@ func (e *Engine) endVector(s *series, c *rules.Compiled, now int64) {
 	}
 }
 
-func (e *Engine) maybeSignal(sigKey string, key seriesKey, c *rules.Compiled, ent effEntry, s *series, r rate, res checkResult, target, scope string, obj *Object, now int64) {
-	cfg := e.cfg.Engine
-	sig := Signal{
-		RuleID: c.ID, RuleName: c.Name, Category: c.Category, Scope: scope, Direction: c.Direction,
-		Target: target, ObjectID: obj.ID, ObjectName: obj.Name, PeakRatio: res.ratio, PeakZ: res.z,
-		CurPPS: r.PPS, CurBPS: r.BPS, BaselinePPS: s.bPPS, BaselineBPS: s.bBPS,
-		ThresholdPPS: float64(ent.t.PPS), ThresholdBPS: float64(ent.t.BPS),
-	}
+// signalKind decides whether a non-triggering series deviates enough to be a
+// candidate for the AI analyst ("" = no). It only reads the series and the
+// configuration, so it can run in the parallel evaluation phase.
+func (e *Engine) signalKind(s *series, r rate, res *checkResult, now int64) string {
+	cfg := &e.cfg.Engine
 	// A rising rate is required for near-threshold signals once the baseline
 	// is known: traffic that normally sits near a threshold is a tuning
-	// matter (visible in target analysis), not an anomaly. While the
-	// baseline is still being learned (e.g. right after a restart) "rising"
-	// cannot be judged, so only rates close to the threshold are reported.
+	// matter (visible in target analysis), not an anomaly.
 	var rising bool
 	switch {
 	case res.ready:
@@ -875,34 +1114,43 @@ func (e *Engine) maybeSignal(sigKey string, key seriesKey, c *rules.Compiled, en
 	}
 	switch {
 	case res.ratio >= 1 && !res.condOK:
-		sig.Kind = "conditions_unmet"
-		sig.Condition = res.condFail
-		sig.Detail = fmt.Sprintf("Eşik aşıldı (%s) ancak koşul sağlanmadı: %s", res.reason, res.condFail)
+		return "conditions_unmet"
 	case res.ratio >= cfg.NearMissRatio && rising:
-		sig.Kind = "near_threshold"
-		if res.ratio >= 1 {
-			sig.Detail = fmt.Sprintf("Kısa süreli eşik aşımı (%s), sustain süresi dolmadı", res.reason)
-		} else {
-			sig.Detail = fmt.Sprintf("Eşiğin %%%.0f seviyesinde (%s)", res.ratio*100, res.reason)
-		}
+		return "near_threshold"
 	case res.ready && res.z >= cfg.SignalMinZ &&
 		(r.PPS >= 2*s.bPPS || r.BPS >= 2*s.bBPS) &&
 		(r.PPS >= float64(cfg.SignalMinPPS) || r.BPS >= float64(cfg.SignalMinBPS)):
-		sig.Kind = "baseline_deviation"
+		return "baseline_deviation"
+	}
+	return ""
+}
+
+// emitSignal records a candidate signal that persisted long enough.
+func (e *Engine) emitSignal(kind string, key seriesKey, c *rules.Compiled, ent effEntry, s *series, r rate, res *checkResult, now int64) {
+	target, scope := e.targetOf(key, c)
+	obj := e.objs.objects[key.obj]
+	sig := Signal{
+		Kind: kind, RuleID: c.ID, RuleName: c.Name, Category: c.Category, Scope: scope, Direction: c.Direction,
+		Target: target, ObjectID: obj.ID, ObjectName: obj.Name, PeakRatio: res.ratio, PeakZ: res.z,
+		CurPPS: r.PPS, CurBPS: r.BPS, BaselinePPS: s.bPPS, BaselineBPS: s.bBPS,
+		ThresholdPPS: float64(ent.t.PPS), ThresholdBPS: float64(ent.t.BPS),
+	}
+	switch kind {
+	case "conditions_unmet":
+		sig.Condition = res.condFail()
+		sig.Detail = fmt.Sprintf("Eşik aşıldı (%s) ancak koşul sağlanmadı: %s", res.reason(), sig.Condition)
+	case "near_threshold":
+		if res.ratio >= 1 {
+			sig.Detail = fmt.Sprintf("Kısa süreli eşik aşımı (%s), sustain süresi dolmadı", res.reason())
+		} else {
+			sig.Detail = fmt.Sprintf("Eşiğin %%%.0f seviyesinde (%s)", res.ratio*100, res.reason())
+		}
+	default:
 		sig.Detail = fmt.Sprintf("Baseline'dan sapma: z=%.1f, %s (baseline %s), %s (baseline %s)",
 			res.z, human(r.PPS, "pps"), human(s.bPPS, "pps"), human(r.BPS, "bps"), human(s.bBPS, "bps"))
-	default:
-		s.devSecs = 0
-		return
-	}
-	// Persistence: short blips are normal at host level and must not wake
-	// the analyst.
-	s.devSecs++
-	if s.devSecs < cfg.SignalMinSeconds {
-		return
 	}
 	sig.RelatedIncident = e.incidents.relatedActive(targetKey(c.Direction, scope, target), c.Direction, scope, target)
-	e.signals.observe(sigKey, sig, now)
+	e.signals.observe(c.ID+"|"+c.Direction+"|"+target, sig, now)
 }
 
 // collectEvidence builds the forensic snapshot for an incident. If newRule is
@@ -912,12 +1160,30 @@ func (e *Engine) collectEvidence(id, newRule string, window int64) {
 		return
 	}
 	defer e.evidenceBusy.Delete(id)
+	e.evidenceSem <- struct{}{}
+	defer func() { <-e.evidenceSem }()
 	inc := e.incidents.Get(id)
 	if inc == nil {
 		return
 	}
 	pred := e.incidentPredicate(inc)
 	f := flowstore.Filter{Seconds: int(window * 3)}
+	// The target also goes into the filter so the store can reject other
+	// records on their compact form without expanding them (the predicate
+	// still decides): at provider rates the window holds millions of flows.
+	switch inc.Scope {
+	case "host", "prefix":
+		if inc.Direction == "outbound" {
+			f.Src = inc.Target
+		} else {
+			f.Dst = inc.Target
+		}
+	case "object":
+		if inc.ObjectID >= 0 {
+			id := int(inc.ObjectID)
+			f.ObjectID = &id
+		}
+	}
 	bd, err := e.store.Breakdown(f, pred, 10)
 	if err == nil {
 		samples, _ := e.store.Samples(f, pred, 25)
@@ -999,7 +1265,7 @@ func (e *Engine) publish(now int64) {
 	}
 	snap := &Snapshot{
 		Time: now, WindowSeconds: e.window, Global: e.totals.Window(-1, now, e.window),
-		Series: len(e.series), ActiveIncidents: active, TotalIncidents: total,
+		Series: e.st.len(), ActiveIncidents: active, TotalIncidents: total,
 		PendingSignals: len(e.signals.List(true, 3, 0)),
 		RecordsPerSec:  e.rps, RecordsTotal: count, Dropped: e.dropped.Load(), EvalMillis: e.evalMillis,
 		FlowStoreLen: n, FlowStoreCap: capacity, OldestFlow: e.store.OldestUnix(),
@@ -1076,20 +1342,18 @@ func (e *Engine) reload(ov map[string]rules.Override) error {
 	return e.Do(func() {
 		old := e.set
 		now := e.clock()
-		next := map[seriesKey]*series{}
-		for key, s := range e.series {
+		e.st.rebuild(func(key seriesKey, s *series) (seriesKey, bool) {
 			oc := old.Rules[key.rule]
 			nc, ok := set.ByID[oc.ID]
 			if !ok {
 				if s.active {
 					e.endVector(s, oc, now)
 				}
-				continue
+				return key, false
 			}
 			key.rule = uint16(nc.Index)
-			next[key] = s
-		}
-		e.series = next
+			return key, true
+		}, func(k seriesKey) int { return shardOfKey(k, e.objs, len(e.st.shards)) })
 		e.applyRules(set)
 	})
 }
@@ -1146,16 +1410,38 @@ func (e *Engine) TargetState(addr netip.Addr, ruleID string, withHistory bool) (
 	err := e.Do(func() {
 		now := e.clock()
 		objID := e.objs.lookup(addr)
-		for key, s := range e.series {
+		if objID < 0 {
+			return
+		}
+		// Only two shards can hold series containing addr: the one of its
+		// carpet prefix (host, prefix scope) and the one of its object.
+		n := len(e.st.shards)
+		hostShard := int(prefixHash(e.objs.objects[objID].carpetPrefix(addr)) % uint32(n))
+		shards := []int{hostShard}
+		if os := int(objID) % n; os != hostShard {
+			shards = append(shards, os)
+		}
+		for _, si := range shards {
+			for key, s := range e.st.shards[si].m {
+				e.targetStateOf(&out, key, s, addr, objID, ruleID, withHistory, now)
+			}
+		}
+	})
+	return out, err
+}
+
+func (e *Engine) targetStateOf(out *[]TargetRuleState, key seriesKey, s *series, addr netip.Addr, objID int32, ruleID string, withHistory bool, now int64) {
+	{
+		{
 			if key.obj != objID {
-				continue
+				return
 			}
 			c := e.set.Rules[key.rule]
 			if ruleID != "" && c.ID != ruleID {
-				continue
+				return
 			}
 			if key.pfx.IsValid() && !key.pfx.Contains(addr) {
-				continue
+				return
 			}
 			ent := e.eff[key.rule][key.obj]
 			r := s.window(now, e.window)
@@ -1176,23 +1462,43 @@ func (e *Engine) TargetState(addr netip.Addr, ruleID string, withHistory bool) (
 			if res.condOK {
 				st.Conditions = "ok"
 			} else {
-				st.Conditions = res.condFail
+				st.Conditions = res.condFail()
 			}
 			if withHistory {
 				st.History = s.minutes(now)
 				st.Recent = s.seconds(now, 60)
 			}
-			out = append(out, st)
+			*out = append(*out, st)
 		}
-	})
-	return out, err
+	}
 }
 
 // TopSeries returns the series with the highest ratio to their thresholds.
 func (e *Engine) TopSeries(limit int) ([]TargetRuleState, error) {
 	var out []TargetRuleState
 	err := e.Do(func() {
-		for key, s := range e.series {
+		// Select the top series by ratio first; building the full state for
+		// every series is too costly with hundreds of thousands of them.
+		k := limit
+		if k <= 0 {
+			k = 100
+		}
+		top := make([]seriesRef, 0, k+1)
+		minRatio := func() float64 { return top[len(top)-1].s.lastRatio }
+		e.st.each(func(key seriesKey, s *series) {
+			if len(top) == k && s.lastRatio <= minRatio() {
+				return
+			}
+			i := sort.Search(len(top), func(i int) bool { return top[i].s.lastRatio < s.lastRatio })
+			top = append(top, seriesRef{})
+			copy(top[i+1:], top[i:])
+			top[i] = seriesRef{key, s}
+			if len(top) > k {
+				top = top[:k]
+			}
+		})
+		for _, ref := range top {
+			key, s := ref.key, ref.s
 			c := e.set.Rules[key.rule]
 			target, scope := e.targetOf(key, c)
 			out = append(out, TargetRuleState{

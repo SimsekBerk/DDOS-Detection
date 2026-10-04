@@ -4,28 +4,54 @@ Bu doküman ddosd'yi kendi ağınızda üretim ortamında çalıştırmak için 
 
 ## 1. Boyutlandırma
 
-Ölçülen değerler (Apple M3 Pro, 11 çekirdek; ayrıntılar [BENCHMARK.md](BENCHMARK.md)):
+ddosd paketleri değil flow kayıtlarını işler. Boyutlandırmanın asıl girdileri:
 
-| Bileşen | Ölçülen kapasite |
-|---|---|
-| Decode (tek çekirdek) | NetFlow v9 ~7,4M · IPFIX ~7,1M · sFlow ~10,8M kayıt/sn |
-| Motor (tek çekirdek, 52 kural) | ~2,2M kayıt/sn |
-| Uçtan uca UDP (tek exporter, loopback) | 2M kayıt/sn kayıpsız; ~2,6M kayıt/sn'de doyma |
+1. **Saniyedeki flow kaydı:** sFlow'da ≈ toplam pps / örnekleme oranı. Örnekli NetFlow/IPFIX'te bunun yaklaşık yarısıdır (bir kayıt birkaç örneklenmiş paketi toplar). GenieATM veya router'ın "flows/s" sayacı en doğru değerdir.
+2. **Aktif hedef host sayısı:** seri sayısını ve belleği belirler (host başına ~4–8 seri).
+3. **Korunan prefix/nesne sayısı:** nesne başına ~240 KB trafik geçmişi tutulur.
+4. **Saldırı payı:** saldırı sırasında kayıt hızı normal tepenin birkaç katına çıkabilir; kapasite buna göre planlanmalıdır.
 
-Pratik öneriler:
+Ölçüm (`ddos-bench sizing`; Apple M3 Pro, 11 çekirdek; 2.000 müşteri prefix'i, 100 bin aktif host, 9 router, 1:1000 örnekleme, 330 Mpps tepe; ayrıntı [BENCHMARK.md](BENCHMARK.md) §2.4):
 
-| Ağ | Tahmini flow hızı | Sunucu |
+| Senaryo | Kayıt/sn | Motor doluluğu | Değerlendirme | Bellek |
+|---|---|---|---|---|
+| NetFlow/IPFIX 1:1000, tepe | 150 bin | %6 | 25 ms/sn | 2,1 GB |
+| sFlow 1:1000, tepe | 330 bin | %12 | 33 ms/sn | 2,9 GB |
+| Tepe + 300 Mpps saldırı | 630 bin | %22 | 35 ms/sn | 3,2 GB |
+| Tepe + 700 Mpps saldırı | 1,03 milyon | %41 | 41 ms/sn | 3,6 GB |
+| Tepe + 1,7 Gpps saldırı (200 hedef) | 2,03 milyon | %143 (sınır ≈1,4 milyon) | 127 ms/sn | 4,8 GB |
+| Tepe, 500 bin aktif host | 330 bin | %19 | 82 ms/sn | 4,8 GB |
+
+"Motor doluluğu", motorun her saniyenin ne kadarını kayıt işleme ve değerlendirmeyle geçirdiğidir (paralel çalışır); %100'ü geçtiğinde motor geride kalır ve kuyruk taşar.
+
+Bellek kalemleri:
+
+| Kalem | Formül | Örnek |
 |---|---|---|
-| Kurumsal / küçük DC (≤ 40 Gbps, sFlow 1:2000) | < 50k kayıt/sn | 2 vCPU, 4 GB RAM |
-| Bölgesel ISS (≤ 400 Gbps, 1:1000–1:4000) | 100–500k kayıt/sn | 4–8 vCPU, 8–16 GB RAM |
-| Büyük operatör (çoklu PoP) | > 1M kayıt/sn | PoP başına bir ddosd veya [ARCHITECTURE.md](ARCHITECTURE.md) §2 shard'lı mimari |
+| Flow deposu (adli inceleme) | kayıt/sn × saklama sn × 104 bayt | 330 bin × 30 sn ≈ 1,0 GB |
+| Seriler | seri sayısı × ~1,7 KB | 840 bin seri ≈ 1,4 GB |
+| Nesne geçmişi + kurallar | nesne sayısı × ~240 KB | 2.000 nesne ≈ 0,5 GB |
 
-Bellek büyük ölçüde flow halka tamponundan (`engine.recent_flows`, kayıt başına ~180 bayt; varsayılan 500k kayıt ≈ 90 MB) ve izlenen seri sayısından (`engine.max_series`) gelir.
+Önerilen sunucu sınıfları:
+
+| Ağ | Kayıt/sn (tepe + saldırı) | CPU | RAM | Ağ |
+|---|---|---|---|---|
+| Kurumsal / küçük DC (≤ 40 Gbps) | < 50 bin | 4 çekirdek | 8 GB | 1 GbE |
+| Bölgesel ISS (≤ 400 Gbps) | 50–300 bin | 8 çekirdek | 16 GB | 1–10 GbE |
+| Büyük operatör (1–5 Tbps) | 300 bin – 1,5 milyon | 16 çekirdek | 32–64 GB | 10 GbE |
+
+Ayarlar:
+
+- `engine.max_series`: aktif host sayısı × 8 (ör. 100 bin host → 1.000.000). Varsayılan 250.000 küçük/orta ağlar içindir; dolduğunda yeni host serileri açılmaz (`ddosd_engine_series_overflow_total`).
+- `engine.recent_flows`: tepe kayıt/sn × 30–60 sn. Kanıt toplama son 30 sn'yi kullanır.
+- `collector.workers`: en az router sayısı kadar (her exporter tek bir worker'a düşer).
+- Router export'u: 100G+ arayüzlerde sFlow için 1:2048–1:8192, NetFlow/IPFIX için 1:1000–1:2000 örnekleme ve active timeout 10 sn önerilir. Yüksek örnekleme oranı kayıt hızını ve telemetri trafiğini düşürür; Tbps ölçeğinde algılama doğruluğunu etkilemez.
+- Telemetri trafiği: sFlow örneği ~200 bayt (330 bin örnek/sn ≈ 530 Mbps), IPFIX kaydı ~50 bayt (150 bin kayıt/sn ≈ 60 Mbps). Saldırı anında katlanabileceği için collector arayüzü 10 GbE olmalıdır.
 
 Linux'ta UDP alım tamponunu büyütün:
 
 ```bash
-sysctl -w net.core.rmem_max=33554432
+sysctl -w net.core.rmem_max=134217728     # 128 MB; büyük operatörde sFlow için
 sysctl -w net.core.rmem_default=8388608
 ```
 

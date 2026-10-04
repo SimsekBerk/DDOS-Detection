@@ -70,7 +70,7 @@ engine:
   signal_min_seconds: 20    # sapma en az bu kadar sürmeli (sinyal gürültüsü bastırma)
   incident_reopen: 2m       # olay bittikten sonra bu sürede tekrar tetiklenirse aynı olay açılır
   evidence_every: 10s
-  max_series: 200000        # izlenen (kural, hedef) serisi üst sınırı — bellek koruması
+  max_series: 250000        # (kural, hedef) seri sınırı ≈ aktif host × 8; seri başına ~1,7 KB (bkz. docs/OPERATIONS.md §1)
 
 # ---------------------------------------------------------------------------
 # Mitigasyon

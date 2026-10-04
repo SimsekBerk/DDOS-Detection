@@ -7,8 +7,9 @@ import (
 )
 
 const (
-	histSeconds = 3600 // 1h at 1s resolution
-	histMinutes = 1440 // 24h at 1m resolution
+	histSeconds       = 3600 // global: 1h at 1s resolution
+	objectHistSeconds = 900  // per object: 15 min at 1s (longer views use minutes)
+	histMinutes       = 1440 // 24h at 1m resolution
 )
 
 // counters is one time slot of traffic totals.
@@ -33,16 +34,23 @@ func (c *counters) add(o *counters, scale float64) {
 	}
 }
 
+// history is one traffic time line. Per-object histories keep fewer
+// seconds: a provider has thousands of objects, and the 1 h / 24 h views are
+// served from the minute resolution.
 type history struct {
-	sec     [histSeconds]counters
-	secT    [histSeconds]int64
+	sec     []counters
+	secT    []int64
 	min     [histMinutes]counters // per-second averages over the minute
 	minT    [histMinutes]int64
 	lastMin int64
 }
 
+func newHistory(seconds int) *history {
+	return &history{sec: make([]counters, seconds), secT: make([]int64, seconds)}
+}
+
 func (h *history) slot(t int64) *counters {
-	i := t % histSeconds
+	i := t % int64(len(h.sec))
 	if h.secT[i] > t {
 		return nil
 	}
@@ -62,7 +70,7 @@ func (h *history) rollMinute(now int64) {
 	h.lastMin = m
 	var sum counters
 	for t := m * 60; t < m*60+60; t++ {
-		i := t % histSeconds
+		i := t % int64(len(h.sec))
 		if h.secT[i] == t {
 			sum.add(&h.sec[i], 1.0/60)
 		}
@@ -80,9 +88,9 @@ type Totals struct {
 }
 
 func newTotals(objects int) *Totals {
-	t := &Totals{global: &history{}}
+	t := &Totals{global: newHistory(histSeconds)}
 	for i := 0; i < objects; i++ {
-		t.objects = append(t.objects, &history{})
+		t.objects = append(t.objects, newHistory(objectHistSeconds))
 	}
 	return t
 }
@@ -195,14 +203,14 @@ func (t *Totals) Series(obj int, now int64, rangeSec, step int64) []TotalPoint {
 		step = 1
 	}
 	var out []TotalPoint
-	if rangeSec <= histSeconds {
+	if rangeSec <= int64(len(h.sec)) {
 		end := now // exclude the current (partial) second
 		start := end - rangeSec
 		start -= start % step
 		for s := start; s < end; s += step {
 			var sum counters
 			for k := s; k < s+step && k < end; k++ {
-				i := k % histSeconds
+				i := k % int64(len(h.sec))
 				if h.secT[i] == k {
 					sum.add(&h.sec[i], 1/float64(step))
 				}
@@ -244,7 +252,7 @@ func (t *Totals) Window(obj int, now, w int64) TotalPoint {
 	}
 	var sum counters
 	for k := now - w; k < now; k++ {
-		i := k % histSeconds
+		i := k % int64(len(h.sec))
 		if h.secT[i] == k {
 			sum.add(&h.sec[i], 1/float64(w))
 		}
@@ -264,7 +272,7 @@ func (t *Totals) remap(n int, idMap map[int32]int32) {
 	}
 	for i := range next {
 		if next[i] == nil {
-			next[i] = &history{}
+			next[i] = newHistory(objectHistSeconds)
 		}
 	}
 	t.objects = next

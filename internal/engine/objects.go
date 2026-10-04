@@ -19,19 +19,25 @@ type Object struct {
 	Notes        string         `json:"notes,omitempty"`
 }
 
-type prefixEntry struct {
-	p   netip.Prefix
-	obj int32
+// prefixLen holds the protected prefixes of one length, keyed by prefix.
+type prefixLen struct {
+	bits int
+	m    map[netip.Prefix]int32
 }
 
 // objectTable does longest-prefix-match lookups over protected prefixes.
+// Prefixes are grouped by length; a lookup masks the address once per
+// distinct length (longest first) and probes a hash map, so the cost
+// depends on the number of distinct lengths, not on the number of prefixes
+// (thousands of customer prefixes stay as fast as a handful).
 type objectTable struct {
 	objects []*Object
-	entries []prefixEntry // sorted by prefix length, longest first
+	v4, v6  []prefixLen // longest first
 }
 
 func newObjectTable(cfg []config.ObjectConfig) *objectTable {
 	t := &objectTable{}
+	byLen := map[bool]map[int]map[netip.Prefix]int32{true: {}, false: {}}
 	for i, oc := range cfg {
 		o := &Object{
 			ID: int32(i), Name: oc.Name, Prefixes: oc.Parsed, Profile: oc.Profile,
@@ -39,18 +45,45 @@ func newObjectTable(cfg []config.ObjectConfig) *objectTable {
 		}
 		t.objects = append(t.objects, o)
 		for _, p := range oc.Parsed {
-			t.entries = append(t.entries, prefixEntry{p, o.ID})
+			p = p.Masked()
+			lens := byLen[p.Addr().Is4()]
+			if lens[p.Bits()] == nil {
+				lens[p.Bits()] = map[netip.Prefix]int32{}
+			}
+			if _, dup := lens[p.Bits()][p]; !dup { // the first object listing a prefix owns it
+				lens[p.Bits()][p] = o.ID
+			}
 		}
 	}
-	sort.SliceStable(t.entries, func(i, j int) bool { return t.entries[i].p.Bits() > t.entries[j].p.Bits() })
+	for v4, lens := range byLen {
+		var list []prefixLen
+		for bits, m := range lens {
+			list = append(list, prefixLen{bits, m})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].bits > list[j].bits })
+		if v4 {
+			t.v4 = list
+		} else {
+			t.v6 = list
+		}
+	}
 	return t
 }
 
 // lookup returns the object id for an address, or -1.
 func (t *objectTable) lookup(a netip.Addr) int32 {
-	for _, e := range t.entries {
-		if e.p.Contains(a) {
-			return e.obj
+	a = a.Unmap()
+	lens := t.v6
+	if a.Is4() {
+		lens = t.v4
+	}
+	for _, l := range lens {
+		p, err := a.Prefix(l.bits)
+		if err != nil {
+			continue
+		}
+		if id, ok := l.m[p]; ok {
+			return id
 		}
 	}
 	return -1

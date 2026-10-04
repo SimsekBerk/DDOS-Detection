@@ -300,3 +300,17 @@ func TestNearThresholdSignalAfterWarmup(t *testing.T) {
 		t.Fatal("expected near-threshold signal for new traffic after warm-up")
 	}
 }
+
+// The detection scenarios must give the same results when the evaluation
+// runs in parallel (normally only above parallelEvalMin series).
+func TestParallelEvaluationSameResults(t *testing.T) {
+	old := parallelEvalMin
+	parallelEvalMin = 1
+	defer func() { parallelEvalMin = old }()
+	t.Run("dns", TestDetectsAndEndsDNSAmplification)
+	t.Run("carpet", TestCarpetBombing)
+	t.Run("concurrent-carpet", TestConcurrentCarpetVectorsBothReported)
+	t.Run("conditions", TestConditionsUnmetSignal)
+	t.Run("near-threshold", TestNearThresholdSignalAfterWarmup)
+	t.Run("sustain", TestSustainPreventsSpikes)
+}

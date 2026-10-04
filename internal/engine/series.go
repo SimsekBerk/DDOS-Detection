@@ -14,8 +14,11 @@ const ringSize = 64
 // maxUniqueTracked caps the per-series unique-source set.
 const maxUniqueTracked = 4096
 
+// bucket holds one second of traffic. float32 keeps the ring compact (a
+// provider tracks hundreds of thousands of series); 24 bits of mantissa are
+// ample for per-second rates.
 type bucket struct {
-	bytes, packets, flows, samples float64
+	bytes, packets, flows, samples float32
 }
 
 // rate is a windowed rate.
@@ -35,8 +38,9 @@ type seriesKey struct {
 // series tracks one (rule, target) pair.
 type series struct {
 	ring  [ringSize]bucket
-	stamp [ringSize]int64
+	stamp [ringSize]uint32 // unix second of each bucket
 
+	shard        uint16 // index in seriesTable.shards
 	trackUniques bool
 	warm         bool // near a threshold: track unique peers
 	uniques      map[netip.Addr]int64
@@ -49,14 +53,9 @@ type series struct {
 	bPPS, vPPS, bBPS, vBPS float64
 	learned                float64
 
-	// per-minute history (avg pps/bps) for analyst/UI drill-down
-	minuteT   [60]int64
-	minutePPS [60]float64
-	minuteBPS [60]float64
-	accPPS    float64
-	accBPS    float64
-	accN      float64
-	accMinute int64
+	// per-minute history for analyst/UI drill-down; allocated only once the
+	// series gets near a threshold or is under attack
+	hist *minuteHist
 
 	// trigger state
 	devSecs   int // consecutive seconds with a signal-worthy deviation
@@ -69,15 +68,25 @@ type series struct {
 	lastRatio float64
 }
 
+type minuteHist struct {
+	t        [60]int64
+	pps, bps [60]float64
+	accPPS   float64
+	accBPS   float64
+	accN     float64
+	accMin   int64
+}
+
 // bucketAt returns the bucket for second t, or nil if the slot already holds
 // a newer second (t is too old for the ring).
 func (s *series) bucketAt(t int64) *bucket {
 	i := t % ringSize
-	if s.stamp[i] > t {
+	st := int64(s.stamp[i])
+	if st > t {
 		return nil
 	}
-	if s.stamp[i] != t {
-		s.stamp[i] = t
+	if st != t {
+		s.stamp[i] = uint32(t)
 		s.ring[i] = bucket{}
 	}
 	return &s.ring[i]
@@ -94,7 +103,7 @@ func (s *series) add(r *flow.Record, now int64, maxSpread int64, peer, target ne
 	if d > maxSpread {
 		d = maxSpread
 	}
-	fb, fp := bytes/float64(d), pkts/float64(d)
+	fb, fp := float32(bytes/float64(d)), float32(pkts/float64(d))
 	for t := now - d + 1; t <= now; t++ {
 		if b := s.bucketAt(t); b != nil {
 			b.bytes += fb
@@ -128,24 +137,24 @@ func (s *series) add(r *flow.Record, now int64, maxSpread int64, peer, target ne
 
 // window returns the rate over the complete seconds [now-w, now-1].
 func (s *series) window(now int64, w int64) rate {
-	var sum bucket
+	var bytes, packets, flows, samples float64
 	active := 0
 	for t := now - w; t < now; t++ {
 		i := t % ringSize
-		if s.stamp[i] == t {
-			b := s.ring[i]
-			sum.bytes += b.bytes
-			sum.packets += b.packets
-			sum.flows += b.flows
-			sum.samples += b.samples
+		if int64(s.stamp[i]) == t {
+			b := &s.ring[i]
+			bytes += float64(b.bytes)
+			packets += float64(b.packets)
+			flows += float64(b.flows)
+			samples += float64(b.samples)
 			if b.packets > 0 {
 				active++
 			}
 		}
 	}
-	r := rate{BPS: sum.bytes * 8 / float64(w), PPS: sum.packets / float64(w), FPS: sum.flows / float64(w), Samples: sum.samples, ActiveSeconds: active}
-	if sum.packets > 0 {
-		r.AvgPktSize = sum.bytes / sum.packets
+	r := rate{BPS: bytes * 8 / float64(w), PPS: packets / float64(w), FPS: flows / float64(w), Samples: samples, ActiveSeconds: active}
+	if packets > 0 {
+		r.AvgPktSize = bytes / packets
 	}
 	return r
 }
@@ -192,20 +201,29 @@ func zScore(x, mean, variance float64) float64 {
 	return (x - mean) / sd
 }
 
-// recordMinute accumulates per-second rates into the minute history.
+// recordMinute accumulates per-second rates into the minute history. Cold
+// series (far below every threshold) keep none.
 func (s *series) recordMinute(now int64, r rate) {
-	m := now / 60
-	if s.accMinute != m && s.accN > 0 {
-		i := s.accMinute % 60
-		s.minuteT[i] = s.accMinute * 60
-		s.minutePPS[i] = s.accPPS / s.accN
-		s.minuteBPS[i] = s.accBPS / s.accN
-		s.accPPS, s.accBPS, s.accN = 0, 0, 0
+	h := s.hist
+	if h == nil {
+		if !s.warm && !s.active {
+			return
+		}
+		h = &minuteHist{}
+		s.hist = h
 	}
-	s.accMinute = m
-	s.accPPS += r.PPS
-	s.accBPS += r.BPS
-	s.accN++
+	m := now / 60
+	if h.accMin != m && h.accN > 0 {
+		i := h.accMin % 60
+		h.t[i] = h.accMin * 60
+		h.pps[i] = h.accPPS / h.accN
+		h.bps[i] = h.accBPS / h.accN
+		h.accPPS, h.accBPS, h.accN = 0, 0, 0
+	}
+	h.accMin = m
+	h.accPPS += r.PPS
+	h.accBPS += r.BPS
+	h.accN++
 }
 
 // Point is a time series point.
@@ -225,10 +243,10 @@ func (s *series) seconds(now int64, n int64) []Point {
 	for t := now - n; t < now; t++ {
 		i := t % ringSize
 		p := Point{T: t}
-		if s.stamp[i] == t {
-			p.BPS = s.ring[i].bytes * 8
-			p.PPS = s.ring[i].packets
-			p.FPS = s.ring[i].flows
+		if int64(s.stamp[i]) == t {
+			p.BPS = float64(s.ring[i].bytes) * 8
+			p.PPS = float64(s.ring[i].packets)
+			p.FPS = float64(s.ring[i].flows)
 		}
 		out = append(out, p)
 	}
@@ -238,11 +256,15 @@ func (s *series) seconds(now int64, n int64) []Point {
 // minutes returns the per-minute history, oldest first.
 func (s *series) minutes(now int64) []Point {
 	var out []Point
+	h := s.hist
+	if h == nil {
+		return out
+	}
 	cur := now / 60
 	for m := cur - 59; m < cur; m++ {
 		i := m % 60
-		if s.minuteT[i] == m*60 {
-			out = append(out, Point{T: m * 60, BPS: s.minuteBPS[i], PPS: s.minutePPS[i]})
+		if h.t[i] == m*60 {
+			out = append(out, Point{T: m * 60, BPS: h.bps[i], PPS: h.pps[i]})
 		}
 	}
 	return out
