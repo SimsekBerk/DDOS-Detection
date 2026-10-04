@@ -19,3 +19,6 @@ web/node_modules/
 .vscode/
 web/tsconfig.tsbuildinfo
 /data-preprod.log
+
+# ddos-bench output
+bench-results.json
